@@ -1,0 +1,38 @@
+{
+	"name": "CourierBench",
+	"emitLegacyScripts": false,
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"Courier": {
+				"$path": "../src"
+			},
+			"Bench": {
+				"$className": "Folder",
+				"Config": {
+					"$path": "Config.luau"
+				},
+				"Framework": {
+					"$path": "Framework.luau"
+				},
+				"Runs": {
+					"$path": "Runs"
+				},
+				"Shared": {
+					"$path": "Shared"
+				},
+				"Vendor": {
+					"$path": "vendor"
+				},
+				"Client": {
+					"$path": "Client.client.luau"
+				}
+			}
+		},
+		"ServerScriptService": {
+			"Bench": {
+				"$path": "Server.server.luau"
+			}
+		}
+	}
+}

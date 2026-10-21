@@ -1,0 +1,111 @@
+struct Entity {
+    id: u8,
+    x: u8,
+    y: u8,
+    z: u8,
+    orientation: u8,
+    animation: u8,
+}
+
+event Booleans {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: array<bool, 1000>,
+}
+
+event Entities {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: array<Entity, 1000>,
+}
+
+event Strings {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: array<string<50>, 500>,
+}
+
+event Numbers {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: array<u8, 2000>,
+}
+
+event Dict {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: map<string<50>, u8, 500>,
+}
+
+event Vectors {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: array<vector, 500>,
+}
+
+struct Unit {
+    id: u16,
+    position: vector,
+    yaw: u16,
+    health: u8,
+}
+
+struct HitData {
+    attacker: u16,
+    target: u16,
+    damage: u8,
+}
+
+struct PickupData {
+    item: u16,
+    slot: u8,
+}
+
+struct InputData {
+    move: vector,
+    look: vector,
+    jump: bool,
+    fire: bool,
+    crouch: bool,
+}
+
+event State {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: array<Unit, 64>,
+}
+
+event Hit {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: HitData,
+}
+
+event Pickup {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: PickupData,
+}
+
+event Chat {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: string<200>,
+}
+
+event Input {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: InputData,
+}

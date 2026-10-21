@@ -1,0 +1,122 @@
+option ClientOutput = "vendor/blinkblox/Client.luau"
+option ServerOutput = "vendor/blinkblox/Server.luau"
+option RemoteScope = "BLINKBLOX"
+
+option MaxPacketSize = 2097152
+option MaxEventsPerPacket = 2048
+option InboundBytesPerSecond = 1073741824
+option InboundBurst = 1073741824
+
+struct Entity {
+    id: u8,
+    x: u8,
+    y: u8,
+    z: u8,
+    orientation: u8,
+    animation: u8
+}
+
+event Booleans {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: boolean[0..1000]
+}
+
+event Entities {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: Entity[0..1000]
+}
+
+event Strings {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: string(0..50)[0..500]
+}
+
+event Numbers {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: u8[0..2000]
+}
+
+map DictMap = {[string(0..50)]: u8}
+
+event Dict {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: DictMap
+}
+
+event Vectors {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: vector[0..500]
+}
+
+struct Unit {
+    id: u16,
+    position: vector,
+    yaw: u16,
+    health: u8
+}
+
+struct HitData {
+    attacker: u16,
+    target: u16,
+    damage: u8
+}
+
+struct PickupData {
+    item: u16,
+    slot: u8
+}
+
+struct InputData {
+    move: vector,
+    look: vector,
+    jump: boolean,
+    fire: boolean,
+    crouch: boolean
+}
+
+event State {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: Unit[0..64]
+}
+
+event Hit {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: HitData
+}
+
+event Pickup {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: PickupData
+}
+
+event Chat {
+    From: Server,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: string(0..200)
+}
+
+event Input {
+    From: Client,
+    Type: Reliable,
+    Call: SingleSync,
+    Data: InputData
+}
