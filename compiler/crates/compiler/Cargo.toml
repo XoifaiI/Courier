@@ -1,0 +1,10 @@
+[package]
+name = "courier-compiler"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "compiler.rs"
+
+[dependencies]
+thiserror = { workspace = true }

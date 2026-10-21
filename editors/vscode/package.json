@@ -1,0 +1,67 @@
+{
+	"name": "courier",
+	"displayName": "Courier",
+	"description": "Courier schema files: highlighting, live errors, wire sizes on hover, go to definition, completion",
+	"version": "0.1.1",
+	"publisher": "xoifaii",
+	"license": "MIT",
+	"private": true,
+	"engines": {
+		"vscode": "^1.90.0"
+	},
+	"categories": [
+		"Programming Languages"
+	],
+	"main": "./dist/extension.js",
+	"activationEvents": [],
+	"contributes": {
+		"languages": [
+			{
+				"id": "courier",
+				"aliases": [
+					"Courier",
+					"courier"
+				],
+				"extensions": [
+					".courier"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "courier",
+				"scopeName": "source.courier",
+				"path": "./syntaxes/courier.tmLanguage.json"
+			}
+		],
+		"configuration": {
+			"title": "Courier",
+			"properties": {
+				"courier.path": {
+					"type": "string",
+					"default": "courier",
+					"description": "The courier compiler to run as `courier lsp`; a name on PATH, as Rokit installs it, or a full path."
+				}
+			}
+		},
+		"commands": [
+			{
+				"command": "courier.restart",
+				"title": "Restart Server",
+				"category": "Courier"
+			}
+		]
+	},
+	"scripts": {
+		"bundle": "esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
+		"package": "npm run bundle && vsce package --no-dependencies --skip-license --allow-missing-repository"
+	},
+	"dependencies": {
+		"vscode-languageclient": "^9.0.1"
+	},
+	"devDependencies": {
+		"@vscode/vsce": "4.0.0",
+		"esbuild": "0.28.2"
+	}
+}

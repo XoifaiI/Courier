@@ -1,0 +1,11 @@
+[package]
+name = "xoifaii/courier"
+description = "Runtime for Courier, a schema compiler for bit packed, strictly typed Roblox networking"
+version = "0.1.0"
+license = "MIT"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+exclude = ["**"]
+include = ["src", "src/**", "default.project.json", "wally.toml", "LICENSE"]
+
+[dependencies]

@@ -1,0 +1,89 @@
+# Builds the courier compiler for each platform, the VS Code extension and Courier.rbxm when a v* tag
+# is pushed, and attaches them to a draft GitHub release. Nothing goes public until the draft is
+# published by hand. Asset names carry the platform as Rokit reads it, so `rokit add XoifaiI/Courier`
+# installs the right one once the release is public.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  compiler:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, platform: windows-x86_64, binary: courier.exe }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, platform: linux-x86_64, binary: courier }
+          - { os: macos-latest, target: aarch64-apple-darwin, platform: macos-aarch64, binary: courier }
+          - { os: macos-latest, target: x86_64-apple-darwin, platform: macos-x86_64, binary: courier }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        working-directory: compiler
+        run: cargo build --release --locked -p courier --target ${{ matrix.target }}
+      - name: Archive
+        shell: bash
+        run: |
+          mkdir -p out
+          cp compiler/target/${{ matrix.target }}/release/${{ matrix.binary }} out/
+          cd out
+          7z a "../courier-${GITHUB_REF_NAME}-${{ matrix.platform }}.zip" "${{ matrix.binary }}" > /dev/null || zip "../courier-${GITHUB_REF_NAME}-${{ matrix.platform }}.zip" "${{ matrix.binary }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: courier-${{ matrix.platform }}
+          path: courier-*.zip
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Package
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm run package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: courier-vscode
+          path: editors/vscode/*.vsix
+
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Courier.rbxm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v7.7.0 --repo rojo-rbx/rojo --pattern "rojo-7.7.0-linux-x86_64.zip"
+          unzip -q rojo-7.7.0-linux-x86_64.zip
+          ./rojo build default.project.json -o Courier.rbxm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: courier-runtime
+          path: Courier.rbxm
+
+  draft:
+    needs: [compiler, extension, runtime]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --notes "Draft. Check the assets, write the notes, then publish."

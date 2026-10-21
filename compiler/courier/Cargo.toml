@@ -1,0 +1,16 @@
+[package]
+name = "courier"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "courier"
+path = "main.rs"
+
+[dependencies]
+courier-compiler = { workspace = true }
+courier-editor = { workspace = true }
+lsp-server = { workspace = true }
+lsp-types = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

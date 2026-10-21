@@ -1,0 +1,5 @@
+**
+!package.json
+!dist/extension.js
+!language-configuration.json
+!syntaxes/**

@@ -1,0 +1,467 @@
+--!strict
+--!optimize 2
+
+--[=[
+	Courier: the runtime behind a compiled schema. It owns the remotes, sends each player's
+	messages once per Heartbeat, and runs handlers, middleware and calls
+
+	Set Config before requiring the schema. ReliableCapacity is how much a stream holds before it
+	sends early, and MaxFrameBytes is the biggest frame the server will read from a client
+
+	Return type: the Courier runtime
+	Example usage:
+		local Courier = require(ReplicatedStorage.Courier)
+		Courier.Config.InvokeTimeout = 10
+		Courier.Config.MaxFrameBytes = 1048576
+		local Net = require(ReplicatedStorage.Net)
+--]=]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Types = require("@self/Types")
+local Future = require("@self/Future")
+local Result = require("@self/Result")
+
+type Call = Types.Call
+type Config = Types.Config
+type Event = Types.Event
+type Metadata = Types.Metadata
+type MiddlewareCallback<T> = Types.MiddlewareCallback<T>
+type Reply = Types.Reply
+type Schema = Types.Schema
+type Stream = Types.Stream
+
+export type Future<T...> = Types.Future<T...>
+export type Middleware<T> = Types.Middleware<T>
+
+local IS_SERVER = RunService:IsServer()
+
+local Remotes = script:WaitForChild("Remotes")
+local RELIABLE = Remotes:WaitForChild("Reliable") :: RemoteEvent
+local UNRELIABLE = Remotes:WaitForChild("Unreliable") :: UnreliableRemoteEvent
+
+local Courier = {}
+
+Courier.Config = {
+	ReliableCapacity = 1048576,
+	UnreliableCapacity = 900,
+	InvokeTimeout = 30,
+	MaxFrameBytes = 65536,
+	OnFrame = nil,
+} :: Config
+
+local Bound: Schema? = nil
+
+local PlayerStreams: { [Player]: { Stream } } = {}
+local PlayerList: { Player } = {}
+local StreamList: { { Stream } } = {}
+local ClientStreams: { Stream } = {}
+local StreamOwner: { [Stream]: Player } = {}
+local StreamReliable: { [Stream]: boolean } = {}
+
+local PendingByPlayer: { [Player]: { [number]: thread } } = {}
+local PlayerMetadata: { [Player]: Metadata } = {}
+local ClientPending: { [number]: thread } = {}
+local NextCallId = 0
+
+local FreeThread: thread? = nil
+local SUCCESS = Result.SUCCESS
+local CLIENT_METADATA: Metadata = table.freeze({ Origin = "Server", Direction = "Inbound" } :: Metadata)
+local Rejections: { [any]: Types.Result<any, any> } = setmetatable({}, { __mode = "v" }) :: any
+local WarnedFrameSize = false
+
+local function RunHandler(Handler: (...any) -> (), ...: any)
+	local Acquired = FreeThread
+	FreeThread = nil
+	Handler(...)
+	FreeThread = Acquired
+end
+
+local function Runner()
+	while true do
+		RunHandler(coroutine.yield())
+	end
+end
+
+local function Spawn(Handler: (...any) -> (), ...: any)
+	if FreeThread == nil then
+		local Created = coroutine.create(Runner)
+		coroutine.resume(Created)
+		FreeThread = Created
+	end
+	task.spawn(FreeThread :: thread, Handler, ...)
+end
+
+local function DeepCopy<T>(Target: T): T
+	local Source: any = Target
+	if type(Source) ~= "table" then
+		return Target
+	end
+
+	local Copy = {}
+	for Key, Value in Source do
+		Copy[Key] = if type(Value) == "table" then DeepCopy(Value) else Value
+	end
+	return Copy :: any
+end
+
+local function Settle(Timeout: thread, Success: boolean, ...: any): ...any
+	if coroutine.status(Timeout) == "suspended" then
+		task.cancel(Timeout)
+	end
+	if not Success then
+		error((...), 0)
+	end
+	return ...
+end
+
+local function SendResults(Reply: Reply, Name: string, Sender: Player?, CallId: number, Success: boolean, ...: any)
+	if Success then
+		Reply(Sender, CallId, true, ...)
+		return
+	end
+	warn(`Courier: the handler for {Name} failed: {(...)}`)
+	Reply(Sender, CallId, false, "the handler failed")
+end
+
+local function PendingFor(Peer: Player?): { [number]: thread }?
+	if Peer then
+		return PendingByPlayer[Peer]
+	end
+	return ClientPending
+end
+
+local function MetadataFor(Sender: Player?): Metadata
+	if Sender == nil then
+		return CLIENT_METADATA
+	end
+	return PlayerMetadata[Sender]
+		or table.freeze({ Origin = "Client", Player = Sender, Direction = "Inbound" } :: Metadata)
+end
+
+local function Fail(Pending: { [number]: thread }, CallId: number, Thread: thread, Reason: string)
+	if Pending[CallId] ~= Thread then
+		return
+	end
+	Pending[CallId] = nil
+	if coroutine.status(Thread) == "suspended" then
+		task.spawn(Thread, false, Reason)
+	end
+end
+
+local function Send(Stream: Stream)
+	local Frame, Instances = (Bound :: Schema).Finish(Stream)
+	local Remote: any = if StreamReliable[Stream] then RELIABLE else UNRELIABLE
+	if IS_SERVER then
+		local Player = StreamOwner[Stream]
+		if Instances then
+			Remote:FireClient(Player, Frame, Instances)
+		else
+			Remote:FireClient(Player, Frame)
+		end
+	elseif Instances then
+		Remote:FireServer(Frame, Instances)
+	else
+		Remote:FireServer(Frame)
+	end
+end
+
+local function NewStreams(Owner: Player?): { Stream }
+	local Schema = Bound :: Schema
+	local Streams = {
+		Schema.NewStream(Courier.Config.ReliableCapacity),
+		Schema.NewStream(Courier.Config.UnreliableCapacity),
+	}
+	StreamReliable[Streams[1]] = true
+	StreamReliable[Streams[2]] = false
+	if Owner then
+		StreamOwner[Streams[1]] = Owner
+		StreamOwner[Streams[2]] = Owner
+	end
+	return Streams
+end
+
+local function Flush()
+	local IsEmpty = (Bound :: Schema).IsEmpty
+	if IS_SERVER then
+		for _, Streams in PlayerStreams do
+			for _, Stream in Streams do
+				if not IsEmpty(Stream) then
+					Send(Stream)
+				end
+			end
+		end
+	else
+		for _, Stream in ClientStreams do
+			if not IsEmpty(Stream) then
+				Send(Stream)
+			end
+		end
+	end
+end
+
+local function Receive(Player: Player, Frame: unknown, Instances: unknown)
+	local Success = false
+	if typeof(Frame) == "buffer" then
+		local Length = buffer.len(Frame)
+		local Max = Courier.Config.MaxFrameBytes
+		if Length > Max then
+			if not WarnedFrameSize then
+				WarnedFrameSize = true
+				warn(
+					`Courier: refused a {Length} byte frame from {Player.Name}, past Config.MaxFrameBytes of {Max}; raise it if your clients send larger frames`
+				)
+			end
+		else
+			Success = (Instances == nil or type(Instances) == "table")
+				and (Bound :: Schema).ReadOnServer(Frame, Player, Instances :: { any }?)
+		end
+	end
+	local OnFrame = Courier.Config.OnFrame
+	if OnFrame then
+		OnFrame(Player, Success)
+	end
+end
+
+local function AddPlayer(Player: Player)
+	if PlayerStreams[Player] then
+		return
+	end
+	local Streams = NewStreams(Player)
+	PlayerStreams[Player] = Streams
+	table.insert(PlayerList, Player)
+	table.insert(StreamList, Streams)
+	PendingByPlayer[Player] = {}
+	PlayerMetadata[Player] = table.freeze({ Origin = "Client", Player = Player, Direction = "Inbound" } :: Metadata)
+end
+
+local function RemovePlayer(Player: Player)
+	local Streams = PlayerStreams[Player]
+	if Streams then
+		for _, Stream in Streams do
+			StreamOwner[Stream] = nil
+			StreamReliable[Stream] = nil
+		end
+	end
+	PlayerStreams[Player] = nil
+	local Index = table.find(PlayerList, Player)
+	if Index then
+		local Last = #PlayerList
+		PlayerList[Index] = PlayerList[Last]
+		StreamList[Index] = StreamList[Last]
+		PlayerList[Last] = nil
+		StreamList[Last] = nil
+	end
+
+	local Pending = PendingByPlayer[Player]
+	PendingByPlayer[Player] = nil
+	PlayerMetadata[Player] = nil
+	if Pending then
+		for CallId, Thread in Pending do
+			Fail(Pending, CallId, Thread, "the player left")
+		end
+	end
+end
+
+local CallProto = {}
+CallProto.__index = CallProto
+
+function CallProto.Reject(self: Call, Reason: any)
+	if Reason == nil or Reason ~= Reason then
+		self.State = Result.Error(Reason)
+		return
+	end
+	local Rejection = Rejections[Reason]
+	if Rejection == nil then
+		Rejection = Result.Error(Reason)
+		Rejections[Reason] = Rejection
+	end
+	self.State = Rejection
+end
+
+local MiddlewareProto = {}
+MiddlewareProto.__index = MiddlewareProto
+
+function MiddlewareProto.GetDataFor<T>(self: Middleware<T>, EventName: string): T
+	if not self.EventData[EventName] then
+		local Template = if type(self.Template) == "function" then (self.Template :: any)() else DeepCopy(self.Template)
+		self.EventData[EventName] = Template
+	end
+
+	return self.EventData[EventName]
+end
+
+local EventProto = {}
+EventProto.__index = EventProto
+
+function EventProto.AddMiddleware(self: Event, Middleware: Middleware<any>)
+	if not table.find(self.Middlewares, Middleware) then
+		table.insert(self.Middlewares, Middleware)
+		table.insert(self.Data, Middleware:GetDataFor(self.Name))
+	end
+end
+
+function EventProto.RunMiddlewares(self: Event, Sender: Player?, Args: { any }): (Call?, any)
+	local Context: Call = setmetatable({
+		Metadata = MetadataFor(Sender),
+		Args = Args,
+		Shared = {},
+		State = SUCCESS,
+	}, self.Call) :: any
+	local Data = self.Data
+	for Index, Middleware in self.Middlewares do
+		Middleware.Callback(Context, Data[Index])
+		local State = Context.State
+		if State ~= SUCCESS and State.Result == "Error" then
+			return nil, State.Reason
+		end
+	end
+	return Context
+end
+
+function EventProto.Handle(self: Event, Handler: (...any) -> (), Sender: Player?, ...: any)
+	if self.Middlewares[1] == nil then
+		if Sender then
+			Spawn(Handler, Sender, ...)
+		else
+			Spawn(Handler, ...)
+		end
+		return
+	end
+	local Context = self:RunMiddlewares(Sender, { ... })
+	if Context == nil then
+		return
+	end
+	local Args, Count = Context.Args, self.Count
+	if Sender then
+		Spawn(Handler, Sender, table.unpack(Args, 1, Count))
+	else
+		Spawn(Handler, table.unpack(Args, 1, Count))
+	end
+end
+
+function EventProto.Respond(self: Event, Handler: (...any) -> ...any, Sender: Player?, CallId: number, ...: any)
+	local Reply = self.Reply :: Reply
+	if self.Middlewares[1] == nil then
+		if Sender then
+			SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, Sender, ...))
+		else
+			SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, ...))
+		end
+		return
+	end
+
+	local Context, Reason = self:RunMiddlewares(Sender, { ... })
+	if Context == nil then
+		Reply(Sender, CallId, false, if Reason ~= nil then tostring(Reason) else "the call was rejected")
+		return
+	end
+	local Args, Count = Context.Args, self.Count
+	if Sender then
+		SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, Sender, table.unpack(Args, 1, Count)))
+	else
+		SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, table.unpack(Args, 1, Count)))
+	end
+end
+
+function EventProto.HandleInvoke(self: Event, Handler: any, Sender: Player?, CallId: number, ...: any)
+	if Handler == nil then
+		(self.Reply :: Reply)(Sender, CallId, false, "nothing handles this call")
+		return
+	end
+	Spawn(self.Respond, self, Handler, Sender, CallId, ...)
+end
+
+function Courier.Middleware<T>(Callback: MiddlewareCallback<T>, Template: T?): Middleware<T>
+	return setmetatable(
+		{
+			Template = Template,
+			EventData = {},
+			Callback = Callback,
+		} :: any,
+		MiddlewareProto
+	) :: any
+end
+
+function Courier.Event(Name: string, Count: number): Event
+	return setmetatable({
+		Name = Name,
+		Count = Count,
+		Middlewares = {},
+		Data = {},
+		Call = { __index = setmetatable({ Count = Count }, CallProto) },
+	}, EventProto) :: any
+end
+
+function Courier.Invoke(Peer: Player?, Write: (CallId: number) -> ()): Future<...any>
+	return Future.New(function(): ...any
+		local Pending = PendingFor(Peer)
+		if Pending == nil then
+			error("Courier: the player left before the call was sent", 0)
+		end
+
+		local CallId = NextCallId
+		NextCallId = bit32.band(CallId + 1, 0xFFFF)
+		if Pending[CallId] ~= nil then
+			error("Courier: 65536 calls are already waiting for results, so this one was not sent", 0)
+		end
+
+		local Thread = coroutine.running()
+		Pending[CallId] = Thread
+		Write(CallId)
+		local Timeout = task.delay(Courier.Config.InvokeTimeout, Fail, Pending, CallId, Thread, "the call timed out")
+
+		return Settle(Timeout, coroutine.yield())
+	end)
+end
+
+function Courier.Complete(Peer: Player?, CallId: number, Success: boolean, ...: any)
+	local Pending = PendingFor(Peer)
+	if Pending == nil then
+		return
+	end
+	local Thread = Pending[CallId]
+	if Thread == nil then
+		return
+	end
+	Pending[CallId] = nil
+	if coroutine.status(Thread) == "suspended" then
+		task.spawn(Thread, Success, ...)
+	end
+end
+
+function Courier.Bind(Schema: Schema)
+	assert(Bound == nil, "Courier: a schema is already bound; a game uses one schema")
+	Bound = Schema
+	Schema.SetOnFull(Send)
+
+	if IS_SERVER then
+		for _, Player in Players:GetPlayers() do
+			AddPlayer(Player)
+		end
+		Players.PlayerAdded:Connect(AddPlayer)
+		Players.PlayerRemoving:Connect(RemovePlayer)
+		RELIABLE.OnServerEvent:Connect(Receive)
+		UNRELIABLE.OnServerEvent:Connect(Receive)
+	else
+		local Streams = NewStreams(nil)
+		ClientStreams[1] = Streams[1]
+		ClientStreams[2] = Streams[2]
+
+		local ReadOnClient = Schema.ReadOnClient :: any
+		RELIABLE.OnClientEvent:Connect(ReadOnClient)
+		UNRELIABLE.OnClientEvent:Connect(ReadOnClient)
+	end
+
+	RunService.Heartbeat:Connect(Flush)
+end
+
+Courier.IsServer = IS_SERVER
+Courier.PlayerStreams = PlayerStreams
+Courier.PlayerList = PlayerList
+Courier.StreamList = StreamList
+Courier.ClientStreams = ClientStreams
+Courier.Middlewares = require("@self/Middlewares")(Courier)
+
+return Courier
