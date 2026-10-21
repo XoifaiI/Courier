@@ -10,8 +10,10 @@ pub const LSHIFT: &str = "bit32.lshift";
 pub const RSHIFT: &str = "bit32.rshift";
 
 pub const READU8: &str = "buffer.readu8";
+pub const READU16: &str = "buffer.readu16";
 pub const READU32: &str = "buffer.readu32";
 pub const WRITEU8: &str = "buffer.writeu8";
+pub const WRITEU16: &str = "buffer.writeu16";
 pub const WRITEU32: &str = "buffer.writeu32";
 pub const READSTRING: &str = "buffer.readstring";
 pub const WRITESTRING: &str = "buffer.writestring";
@@ -32,7 +34,7 @@ pub const REQUIRE: &str = "require";
 pub const VECTOR3_NEW: &str = "Vector3.new";
 pub const CFRAME_NEW: &str = "CFrame.new";
 
-pub const FAST: [&str; 16] = [
-    BAND, BOR, BTEST, COUNTLZ, COUNTRZ, EXTRACT, LSHIFT, RSHIFT, READU8, READU32, WRITEU8, WRITEU32, FLOOR, MAX, MIN,
-    ROUND,
+pub const FAST: [&str; 18] = [
+    BAND, BOR, BTEST, COUNTLZ, COUNTRZ, EXTRACT, LSHIFT, RSHIFT, READU8, READU16, READU32, WRITEU8, WRITEU16, WRITEU32,
+    FLOOR, MAX, MIN, ROUND,
 ];

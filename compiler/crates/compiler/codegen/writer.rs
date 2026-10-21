@@ -5,7 +5,7 @@ use super::emitter::{Base, Emitter};
 use super::types::{enum_table, fields_typed, parameters, screaming};
 use crate::layout::{Chunk, Codec, Count, EventLayout, LeafKind, NodeId, PathId, Tail, bits_for, mask};
 use crate::luau::builtins::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::luau::{BinOp, Block, ExprId, Name, Parameter, Stmt, assign, decrease, increase, local, when};
 use crate::schema::UNION_TAG;
@@ -58,6 +58,7 @@ struct Writer<'e, 'f, 'a> {
     again: ExprId,
     event: &'a str,
     trail: RefCell<Vec<String>>,
+    aligned: Cell<bool>,
 }
 
 impl<'a> Writer<'_, '_, 'a> {
@@ -212,6 +213,12 @@ impl<'a> Writer<'_, '_, 'a> {
         if buffer { b.invoke(LEN, [value]) } else { b.length(value) }
     }
 
+    fn finite(&self, bits: ExprId, exponent: u64, path: PathId) -> Stmt<'a> {
+        let b = self.e.b;
+        let message = format!("Courier: {} must be a finite number, not NaN or infinity", self.place(path));
+        when(b.eq(b.invoke(BAND, [bits, b.hex(exponent)]), b.hex(exponent)), vec![self.fail(message)])
+    }
+
     fn too_short(&self, count: ExprId, min: u32, path: PathId, unit: &str) -> Stmt<'a> {
         let b = self.e.b;
         let message = format!("Courier: {} has fewer {unit} than its schema minimum of {min}", self.place(path));
@@ -352,10 +359,15 @@ impl<'a> Writer<'_, '_, 'a> {
                         b.invoke(ROUND, [self.clamp(scaled, steps)])
                     }
                     Codec::Enum { id, optional: false } => self.enum_index(id, value, 0, leaf.path),
-                    Codec::F32 => b.invoke("F32Bits", [value]),
+                    Codec::F32 => {
+                        out.push(number(locals.leaves[slot], b.invoke("F32Bits", [value])));
+                        out.push(self.finite(b.name(locals.leaves[slot]), 0x7F80_0000, leaf.path));
+                        continue;
+                    }
                     Codec::F64 { high: false } => {
                         let names = vec![locals.leaves[slot], locals.leaves[slot + 1]];
                         out.push(Stmt::Locals(names, Some("number".into()), b.invoke("F64Bits", [value])));
+                        out.push(self.finite(b.name(locals.leaves[slot + 1]), 0x7FF0_0000, leaf.path));
                         continue;
                     }
                     Codec::F64 { high: true } => continue,
@@ -471,6 +483,18 @@ impl<'a> Writer<'_, '_, 'a> {
             .map(|(at, value)| local(Name::Temp('W', at as u32), value))
             .collect();
         body.push(local(Name::Fixed("Byte"), b.floor_div(self.cursor(), b.number(8))));
+        if self.aligned.get() {
+            for at in 0..words {
+                let write = match bits - at * 32 {
+                    8 => WRITEU8,
+                    16 => WRITEU16,
+                    _ => WRITEU32,
+                };
+                let value = b.name(Name::Temp('W', at));
+                body.push(Stmt::Call(b.invoke(write, [self.stream(), at_byte(at * 4), value])));
+            }
+            return vec![Stmt::Do(body), increase(self.cursor(), b.number(bits))];
+        }
         let shift = b.invoke(BAND, [self.cursor(), b.number(7)]);
         body.push(local(Name::Fixed("P"), b.invoke(LSHIFT, [b.number(1), shift])));
         for at in 0..words {
@@ -567,10 +591,16 @@ impl<'a> Writer<'_, '_, 'a> {
                 Tail::Optional { path, node: inner, .. } => {
                     out.push(when(b.ne(e.read(*path), b.nil()), self.node_body(*inner, true)));
                 }
-                Tail::Array { path, count, element, chunk } => {
+                Tail::Array { path, count, element, chunk, padded } => {
                     out.extend(self.coded(count, locals.counts[index]));
                     let total = locals.count(e, index, count);
+                    if *padded {
+                        let past = b.add(self.cursor(), b.number(7));
+                        out.push(assign(self.cursor(), b.invoke(BAND, [past, b.hex(0xFFFF_FFF8)])));
+                    }
+                    let aligned = self.aligned.replace(*padded);
                     out.extend(self.within(*path, "[].", || self.array(*path, count, *element, *chunk, total)));
+                    self.aligned.set(aligned);
                 }
                 Tail::Map { path, count, key, value } => {
                     out.extend(self.coded(count, locals.counts[index]));
@@ -643,13 +673,70 @@ impl<'a> Writer<'_, '_, 'a> {
             out.extend(self.bool_array(e.read(path), total));
             return out;
         }
-        if flat && element_node.bits > 0 && element_node.bits <= PACKED_BITS {
+        if let Some(write) = self.whole_write(element) {
+            out.extend(self.whole_array(element, write, total, position, body));
+            return out;
+        }
+        if flat && element_node.bits > 0 && element_node.bits <= PACKED_BITS && !self.aligned.get() {
             out.extend(self.packed_array(element, total, position, body));
             return out;
         }
         body.extend(self.node_body(element, !flat));
         out.push(Stmt::For(position, b.number(1), total, body));
         out
+    }
+
+    fn whole_write(&self, element: NodeId) -> Option<&'static str> {
+        let layout = self.e.layout;
+        let leaves = layout.leaves(element);
+        if !self.aligned.get() || !layout.tails(element).is_empty() || !layout.groups(element).is_empty() {
+            return None;
+        }
+        match leaves {
+            [leaf]
+                if leaf.is_placed()
+                    && !leaf.is_flag()
+                    && leaf.position == 0
+                    && leaf.bits == layout.node(element).bits =>
+            {
+                match leaf.bits {
+                    8 => Some(WRITEU8),
+                    16 => Some(WRITEU16),
+                    32 => Some(WRITEU32),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn whole_array(
+        &self,
+        element: NodeId,
+        write: &'static str,
+        total: ExprId,
+        position: Name<'a>,
+        prefix: Block<'a>,
+    ) -> Block<'a> {
+        let (e, b) = (self.e, self.e.b);
+        let bytes = e.layout.node(element).bits / 8;
+        let byte = e.temp('B');
+        let mut body = prefix;
+        body.extend(e.scope(e.layout.node(element).base, || {
+            let locals = Locals::new(e, element);
+            let mut out = self.early(element, &locals);
+            out.extend(self.stores(element, &locals));
+            out.push(Stmt::Call(b.invoke(write, [self.stream(), b.name(byte), b.name(locals.leaves[0])])));
+            out.push(increase(b.name(byte), b.number(bytes)));
+            out
+        }));
+        vec![
+            Stmt::Do(vec![
+                local(byte, b.floor_div(self.cursor(), b.number(8))),
+                Stmt::For(position, b.number(1), total, body),
+            ]),
+            increase(self.cursor(), b.mul(total, b.number(e.layout.node(element).bits))),
+        ]
     }
 
     fn packed_array(&self, element: NodeId, total: ExprId, position: Name<'a>, prefix: Block<'a>) -> Block<'a> {
@@ -945,7 +1032,7 @@ pub fn writer<'a>(e: &Emitter<'_, 'a>, event: &EventLayout, spilled: bool) -> St
     let mut arguments = vec![e.b.fixed("Stream"), callee];
     arguments.extend(signature[1..].iter().map(|parameter| e.b.name(parameter.name)));
     let again = e.b.invoke("Overflow", arguments);
-    let writer = Writer { e, again, event: &declared.name, trail: RefCell::new(Vec::new()) };
+    let writer = Writer { e, again, event: &declared.name, trail: RefCell::new(Vec::new()), aligned: Cell::new(false) };
     let mut body = e.scope(base, || writer.message(event));
     e.hoist(&mut body);
     Stmt::Function {

@@ -32,11 +32,23 @@ pub struct Reader<'f, 'e, 'a> {
     mode: Mode,
     spill: bool,
     unrolled: Cell<u32>,
+    aligned: Cell<bool>,
+    head_end: Cell<Option<Name<'a>>>,
+    item_byte: Cell<Option<ExprId>>,
 }
 
 impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
     pub fn new(e: &'f Emitter<'e, 'a>, from: Side, mode: Mode, spill: bool) -> Reader<'f, 'e, 'a> {
-        Reader { e, from, mode, spill, unrolled: Cell::new(0) }
+        Reader {
+            e,
+            from,
+            mode,
+            spill,
+            unrolled: Cell::new(0),
+            aligned: Cell::new(false),
+            head_end: Cell::new(None),
+            item_byte: Cell::new(None),
+        }
     }
 
     fn cursor(&self) -> ExprId {
@@ -57,6 +69,16 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         Stmt::Return(vec![b.number(-1), b.number(0), b.number(0)])
     }
 
+    fn non_finite(&self, leaf: &Leaf, bits: ExprId) -> Option<ExprId> {
+        let exponent = match leaf.kind {
+            LeafKind::Value(Codec::F32) => 0x7F80_0000,
+            LeafKind::Value(Codec::F64 { high: true }) => 0x7FF0_0000,
+            _ => return None,
+        };
+        let b = self.e.b;
+        Some(b.eq(b.invoke(BAND, [bits, b.hex(exponent)]), b.hex(exponent)))
+    }
+
     fn refuse_in_loop(&self) -> Block<'a> {
         vec![assign(self.e.fixed("Valid"), self.e.b.boolean(false)), Stmt::Break]
     }
@@ -69,9 +91,42 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         self.e.b.name(self.e.b.symbol(enum_table(self.e.schema.enumeration(id))))
     }
 
+    fn direct(&self, leaf: &Leaf) -> Option<&'static str> {
+        if !self.aligned.get() || !leaf.is_placed() || leaf.is_flag() || !leaf.position.is_multiple_of(8) {
+            return None;
+        }
+        match leaf.bits {
+            8 => Some(READU8),
+            16 => Some(READU16),
+            32 => Some(READU32),
+            _ => None,
+        }
+    }
+
+    fn fixed_head(&self, node: NodeId) -> bool {
+        self.e.layout.tails(node).iter().all(|tail| match tail {
+            Tail::Bytes { count, .. } => !matches!(count, Count::Coded { .. }),
+            _ => false,
+        })
+    }
+
+    fn hoist(&self, nodes: &[NodeId], total: ExprId, out: &mut Block<'a>) -> bool {
+        let (e, b) = (self.e, self.e.b);
+        if !nodes.iter().all(|node| self.fixed_head(*node)) {
+            return false;
+        }
+        let bits: u32 = nodes.iter().map(|node| e.layout.node(*node).bits).sum();
+        let end = e.temp('H');
+        let past = b.add(self.cursor(), b.add(b.mul(total, b.number(bits)), b.number(7)));
+        out.push(local(end, b.invoke(RSHIFT, [past, b.number(3)])));
+        self.head_end.set(Some(end));
+        true
+    }
+
     fn used_words(&self, node: NodeId) -> Vec<bool> {
         let mut used = vec![false; self.e.layout.node(node).words() as usize];
-        for leaf in self.e.layout.leaves(node).iter().filter(|leaf| leaf.is_placed()) {
+        let words = self.e.layout.leaves(node).iter().filter(|leaf| leaf.is_placed() && self.direct(leaf).is_none());
+        for leaf in words {
             let word = (leaf.position / 32) as usize;
             used[word] = true;
             if leaf.position % 32 + leaf.bits > 32 {
@@ -83,6 +138,9 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
 
     fn high_parts(&self, node: NodeId) -> Vec<bool> {
         let mut high = vec![false; self.e.layout.node(node).words() as usize];
+        if self.aligned.get() {
+            return high;
+        }
         for leaf in self.e.layout.leaves(node).iter().filter(|leaf| leaf.is_placed()) {
             let end = leaf.position + leaf.bits;
             for word in leaf.position / 32..end.div_ceil(32) {
@@ -97,6 +155,22 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
     fn rebuild(&self, node: NodeId, first_word_read: bool) -> Block<'a> {
         let b = self.e.b;
         let used = self.used_words(node);
+        if self.aligned.get() {
+            let direct = self.e.layout.leaves(node).iter().any(|leaf| self.direct(leaf).is_some());
+            if !direct && !used.iter().any(|&is_used| is_used) {
+                return Vec::new();
+            }
+            let byte = self.item_byte.get().unwrap_or_else(|| b.floor_div(self.cursor(), b.number(8)));
+            let mut out = vec![local(Name::Fixed("Byte"), byte)];
+            for (at, &is_used) in used.iter().enumerate() {
+                if is_used {
+                    let offset =
+                        if at == 0 { b.fixed("Byte") } else { b.add(b.fixed("Byte"), b.number(at as u32 * 4)) };
+                    out.push(local(Name::Temp('W', at as u32), b.invoke(READU32, [self.source(), offset])));
+                }
+            }
+            return out;
+        }
         if !used.iter().any(|&is_used| is_used) {
             return Vec::new();
         }
@@ -137,6 +211,11 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
 
     fn extract(&self, leaf: &Leaf) -> ExprId {
         let b = self.e.b;
+        if let Some(read) = self.direct(leaf) {
+            let byte = leaf.position / 8;
+            let offset = if byte == 0 { b.fixed("Byte") } else { b.add(b.fixed("Byte"), b.number(byte)) };
+            return b.invoke(read, [self.source(), offset]);
+        }
         let at = leaf.position / 32;
         let offset = leaf.position % 32;
         if offset + leaf.bits <= 32 {
@@ -302,7 +381,10 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
             for (slot, (leaf, name)) in leaves.iter().zip(&locals.leaves).enumerate() {
                 if matches!(leaf.kind, LeafKind::Value(Codec::F64 { high: true })) {
                     let low = b.name(locals.leaves[slot - 1]);
-                    body.push(assign(b.name(*name), b.invoke("BitsF64", [low, self.extract(leaf)])));
+                    let high = e.temp('S');
+                    body.push(local(high, self.extract(leaf)));
+                    body.push(when(self.non_finite(leaf, b.name(high)).expect("a high word"), vec![self.refuse()]));
+                    body.push(assign(b.name(*name), b.invoke("BitsF64", [low, b.name(high)])));
                 } else if leaf.is_placed() {
                     body.extend(self.leaf_assign(leaf, *name));
                 }
@@ -317,7 +399,7 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
             }
             out.push(Stmt::Do(body));
         }
-        if bits > 0 {
+        if bits > 0 && self.item_byte.get().is_none() {
             out.push(increase(self.cursor(), b.number(bits)));
         }
         self.tails_read(node, locals, out);
@@ -341,15 +423,14 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                     let room = b.sub(self.bit_limit(), self.cursor());
                     out.push(when(b.gt(b.mul(total, b.number(entry_bits)), room), vec![self.refuse()]));
                     out.push(local(held, b.cast(b.table([], false), "any")));
+                    let outer = self.head_end.get();
+                    let hoisted = self.hoist(&[*key, *value], total, out);
                     let mut body = Vec::new();
-                    let read_key = self.node_read(*key, true, None, &mut body);
+                    let read_key = self.node_read(*key, !hoisted, None, &mut body);
                     let key_held = e.temp('K');
                     body.push(local(key_held, read_key));
-                    let real = |leaf: &Leaf| matches!(leaf.kind, LeafKind::Value(Codec::F32 | Codec::F64 { .. }));
-                    if e.layout.leaves(*key).iter().any(real) {
-                        body.push(when(b.ne(b.name(key_held), b.name(key_held)), vec![self.refuse()]));
-                    }
-                    let read_value = self.node_read(*value, true, None, &mut body);
+                    let read_value = self.node_read(*value, !hoisted, None, &mut body);
+                    self.head_end.set(outer);
                     let target = b.index(b.name(held), b.name(key_held));
                     if self.bare_instance(*value) {
                         body.push(when(read_value, vec![assign(target, read_value)]));
@@ -363,8 +444,13 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                     let whole = count_max(count).is_none_or(|max| max >= chunk.size);
                     self.chunked_read(*element, *chunk, whole, total, held, out);
                 }
-                Tail::Array { count, element, chunk: None, .. } => {
+                Tail::Array { count, element, chunk: None, padded, .. } => {
                     let total = self.count_read(count, locals, out);
+                    if *padded {
+                        let past = b.add(self.cursor(), b.number(7));
+                        out.push(assign(self.cursor(), b.invoke(BAND, [past, b.hex(0xFFFF_FFF8)])));
+                    }
+                    let aligned = self.aligned.replace(*padded);
                     let element_node = e.layout.node(*element);
                     let refused = if element_node.min_bits == 0 {
                         b.gt(total, b.number(MAX_INSTANCES))
@@ -375,6 +461,7 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                     out.push(when(refused, vec![self.refuse()]));
                     if reads_bool_bytes(e.layout, count, *element) {
                         self.bool_bytes_read(*element, total, held, out);
+                        self.aligned.set(aligned);
                         continue;
                     }
                     let leaves = e.layout.leaves(*element).len().max(1) as u32;
@@ -390,13 +477,25 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                             (0..fixed).map(|_| self.node_read(*element, false, None, out)).collect();
                         let entries = values.into_iter().map(|value| Entry { key: None, value });
                         out.push(local(held, b.cast(b.table(entries, false), "any")));
+                        self.aligned.set(aligned);
                         continue;
                     }
                     out.push(local(held, b.cast(b.invoke(TABLE_CREATE, [total]), "any")));
                     let position = e.temp('I');
                     let mut body = Vec::new();
                     let has_tails = !e.layout.tails(*element).is_empty();
-                    let value = self.node_read(*element, has_tails, None, &mut body);
+                    let indexed = *padded && !has_tails && !self.bare_instance(*element);
+                    if indexed {
+                        let bytes = element_node.bits / 8;
+                        let base = e.temp('B');
+                        out.push(local(base, b.sub(b.floor_div(self.cursor(), b.number(8)), b.number(bytes))));
+                        let step = if bytes == 1 { b.name(position) } else { b.mul(b.name(position), b.number(bytes)) };
+                        self.item_byte.set(Some(b.add(b.name(base), step)));
+                    }
+                    let outer = self.head_end.get();
+                    let hoisted = has_tails && self.hoist(&[*element], total, out);
+                    let value = self.node_read(*element, has_tails && !hoisted, None, &mut body);
+                    self.head_end.set(outer);
                     if self.bare_instance(*element) {
                         let kept = e.temp('K');
                         out.push(local(kept, b.number(0)));
@@ -411,10 +510,18 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                         body.push(assign(b.index(b.name(held), b.name(position)), value));
                     }
                     out.push(Stmt::For(position, b.number(1), total, body));
+                    if indexed {
+                        self.item_byte.set(None);
+                        out.push(increase(self.cursor(), b.mul(total, b.number(element_node.bits))));
+                    }
+                    self.aligned.set(aligned);
                 }
                 Tail::Bytes { count, buffer, .. } => {
                     let total = self.count_read(count, locals, out);
-                    let used = b.invoke(RSHIFT, [b.add(self.cursor(), b.number(7)), b.number(3)]);
+                    let used = match self.head_end.get() {
+                        Some(end) => b.name(end),
+                        None => b.invoke(RSHIFT, [b.add(self.cursor(), b.number(7)), b.number(3)]),
+                    };
                     let room = b.sub(b.fixed("ByteCursor"), used);
                     out.push(when(b.gt(total, room), vec![self.refuse()]));
                     out.push(decrease(b.fixed("ByteCursor"), total));
@@ -714,15 +821,20 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         if leaf.is_flag() {
             return vec![assign(target, self.flag_value(leaf))];
         }
+        let checked = e.temp('S');
+        if let Some(refused) = self.non_finite(leaf, b.name(checked)) {
+            return vec![
+                local(checked, self.extract(leaf)),
+                when(refused, vec![self.refuse()]),
+                assign(target, self.leaf_value(leaf, b.name(checked))),
+            ];
+        }
         match leaf.check_max {
-            Some(max) => {
-                let checked = e.temp('S');
-                vec![
-                    local(checked, self.extract(leaf)),
-                    when(b.gt(b.name(checked), b.number(max as f64)), vec![self.refuse()]),
-                    assign(target, self.leaf_value(leaf, b.name(checked))),
-                ]
-            }
+            Some(max) => vec![
+                local(checked, self.extract(leaf)),
+                when(b.gt(b.name(checked), b.number(max as f64)), vec![self.refuse()]),
+                assign(target, self.leaf_value(leaf, b.name(checked))),
+            ],
             None => vec![assign(target, self.leaf_value(leaf, self.extract(leaf)))],
         }
     }
@@ -753,12 +865,21 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
             }
             if matches!(leaf.kind, LeafKind::Value(Codec::F64 { high: true })) {
                 let low = *values.last().expect("a double's low word comes first");
-                values.push(b.invoke("BitsF64", [low, self.extract(leaf)]));
+                let high = e.temp('V');
+                checks.push(local(high, self.extract(leaf)));
+                checks.push(when(self.non_finite(leaf, b.name(high)).expect("a high word"), self.refuse_in_loop()));
+                values.push(b.invoke("BitsF64", [low, b.name(high)]));
+                continue;
+            }
+            let checked = e.temp('V');
+            if let Some(refused) = self.non_finite(leaf, b.name(checked)) {
+                checks.push(local(checked, self.extract(leaf)));
+                checks.push(when(refused, self.refuse_in_loop()));
+                values.push(self.leaf_value(leaf, b.name(checked)));
                 continue;
             }
             match leaf.check_max {
                 Some(max) => {
-                    let checked = e.temp('V');
                     checks.push(local(checked, self.extract(leaf)));
                     checks.push(when(b.gt(b.name(checked), b.number(max as f64)), self.refuse_in_loop()));
                     values.push(self.leaf_value(leaf, b.name(checked)));

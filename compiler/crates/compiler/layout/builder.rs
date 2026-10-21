@@ -14,8 +14,14 @@ const ARRAY_K: u32 = 2;
 const SPREAD: u32 = 64;
 
 pub fn layout<'a>(schema: &'a Schema) -> Result<Layout<'a>, Error> {
-    let mut builder =
-        Builder { schema, layout: Layout::default(), open: Vec::new(), spare: Vec::new(), trail: Vec::new() };
+    let mut builder = Builder {
+        schema,
+        layout: Layout::default(),
+        open: Vec::new(),
+        spare: Vec::new(),
+        trail: Vec::new(),
+        aligned: false,
+    };
     for from in Side::BOTH {
         let events: Vec<usize> = (0..schema.events.len()).filter(|index| schema.events[*index].from == from).collect();
         let ids = IdCodes::new(events.len() as u64);
@@ -25,6 +31,7 @@ pub fn layout<'a>(schema: &'a Schema) -> Result<Layout<'a>, Error> {
             let (code, code_bits) = ids.code(position as u32 + 1);
             let aligned = event.fields.iter().any(|field| spreads(schema, field.ty));
             builder.trail.push(&event.name);
+            builder.aligned = aligned;
             let base = builder.path(None, None);
             let offset = if aligned { 0 } else { code_bits };
             let node = builder.node(offset, base, |builder, base| builder.fields(&event.fields, base))?;
@@ -67,8 +74,14 @@ pub struct Measure {
 }
 
 pub fn measure(schema: &Schema, ty: TypeId) -> Result<Measure, Error> {
-    let mut builder =
-        Builder { schema, layout: Layout::default(), open: Vec::new(), spare: Vec::new(), trail: Vec::new() };
+    let mut builder = Builder {
+        schema,
+        layout: Layout::default(),
+        open: Vec::new(),
+        spare: Vec::new(),
+        trail: Vec::new(),
+        aligned: false,
+    };
     let base = builder.path(None, None);
     let node = builder.node(0, base, |builder, base| builder.add(ty, base))?;
     let laid = builder.layout.node(node);
@@ -95,7 +108,7 @@ pub fn measure(schema: &Schema, ty: TypeId) -> Result<Measure, Error> {
 pub fn varies(layout: &Layout, node: NodeId) -> bool {
     layout.tails(node).iter().any(|tail| match tail {
         Tail::Instance { .. } => false,
-        Tail::Array { count: Count::Fixed(_), element, .. } => varies(layout, *element),
+        Tail::Array { count: Count::Fixed(_), element, padded: false, .. } => varies(layout, *element),
         _ => true,
     })
 }
@@ -114,6 +127,7 @@ struct Builder<'a> {
     open: Vec<Open<'a>>,
     spare: Vec<Open<'a>>,
     trail: Vec<&'a str>,
+    aligned: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -338,8 +352,11 @@ impl<'a> Builder<'a> {
             }
             &Type::Map { key, value, bounds } => {
                 let count = self.count(bounds, ARRAY_K, path)?;
-                let key = self.entry(key, "[key]")?;
-                let value = self.entry(value, "[value]")?;
+                let aligned = std::mem::replace(&mut self.aligned, false);
+                let key = self.entry(key, "[key]");
+                let value = self.entry(value, "[value]");
+                self.aligned = aligned;
+                let (key, value) = (key?, value?);
                 let entry_bits = self.layout.node(key).min_bits + self.layout.node(value).min_bits;
                 if entry_bits == 0 {
                     return Err(self.fail(LayoutError::EmptyElement));
@@ -407,7 +424,12 @@ impl<'a> Builder<'a> {
                     };
                     self.current().min_bits += bits;
                 }
-                Ok(self.tail(Tail::Array { path, count, element: node, chunk }))
+                let padded = self.aligned
+                    && chunk.is_none()
+                    && self.layout.tails(node).is_empty()
+                    && element_bits > 0
+                    && element_bits.is_multiple_of(8);
+                Ok(self.tail(Tail::Array { path, count, element: node, chunk, padded }))
             }
             Type::Instance { class } => Ok(self.tail(Tail::Instance { path, class: class.as_deref(), handle: false })),
             Type::Handle => Ok(self.tail(Tail::Instance { path, class: None, handle: true })),

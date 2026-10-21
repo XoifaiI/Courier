@@ -93,7 +93,7 @@ pub enum Count {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tail<'a> {
     Optional { path: PathId, present: LeafSlot, node: NodeId },
-    Array { path: PathId, count: Count, element: NodeId, chunk: Option<Chunk> },
+    Array { path: PathId, count: Count, element: NodeId, chunk: Option<Chunk>, padded: bool },
     Map { path: PathId, count: Count, key: NodeId, value: NodeId },
     Bytes { path: PathId, count: Count, buffer: bool },
     Instance { path: PathId, class: Option<&'a str>, handle: bool },
