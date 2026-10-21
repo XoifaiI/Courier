@@ -22,7 +22,7 @@ jobs:
           - { os: macos-latest, target: x86_64-apple-darwin, platform: macos-x86_64, binary: courier }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -36,7 +36,7 @@ jobs:
           cp compiler/target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
           cd dist
           7z a "../courier-${GITHUB_REF_NAME}-${{ matrix.platform }}.zip" "${{ matrix.binary }}" > /dev/null || zip "../courier-${GITHUB_REF_NAME}-${{ matrix.platform }}.zip" "${{ matrix.binary }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: courier-${{ matrix.platform }}
           path: courier-*.zip
@@ -44,8 +44,8 @@ jobs:
   extension:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Package
@@ -53,7 +53,7 @@ jobs:
         run: |
           npm ci || npm install
           npx --yes @vscode/vsce@3.6.0 package --skip-license --allow-missing-repository
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: courier-vscode
           path: editors/vscode/*.vsix
@@ -62,7 +62,7 @@ jobs:
     needs: [compiler, extension]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
