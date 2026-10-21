@@ -86,7 +86,7 @@ Run in Studio with the [bench](bench), which you can run yourself. All 16 librar
 | Lync | 51 | 31 | 15 | 58 | 28 | 45 |
 | Roblox remotes | 70 | 15 | 18 | 15 | too slow | 32 |
 
-**Game**, a server sending 50 moving units and a few events to a player every frame.
+**Game**, a server sending 50 moving things and a few events to a player every frame.
 
 | | Bytes per frame | Server time per frame |
 |---|---|---|
