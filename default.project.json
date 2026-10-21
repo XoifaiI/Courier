@@ -1,0 +1,11 @@
+{
+	"name": "Courier",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"Courier": {
+				"$path": "src"
+			}
+		}
+	}
+}

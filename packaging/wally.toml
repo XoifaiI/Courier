@@ -1,0 +1,13 @@
+# Draft manifest for publishing the Courier runtime (src/) with Wally; not published.
+# scripts/package.sh assembles the package in dist/runtime, with a project file that maps src/
+# alone; publish from there.
+[package]
+name = "xoifaii/courier"
+description = "Runtime for Courier, a schema compiler for bit packed, strictly typed Roblox networking"
+version = "0.1.0"
+license = "MIT"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+include = ["src", "src/**", "default.project.json", "wally.toml", "LICENSE"]
+
+[dependencies]
