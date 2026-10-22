@@ -6,7 +6,7 @@
 use super::api::{api, bindings};
 use super::declarations::{alias, declarations, schema_types};
 use super::emitter::Emitter;
-use super::reader::Reader;
+use super::reader::{Reader, map_power};
 use super::writer::{writer, writer_name};
 use crate::Error;
 use crate::layout::{Chunk, Codec, Count, Layout, LeafKind, Tail};
@@ -23,6 +23,7 @@ const CODED: &str = include_str!("templates/coded.luau");
 const INSTANCES: &str = include_str!("templates/instances.luau");
 const ROTATION: &str = include_str!("templates/rotation.luau");
 const FLOATS: &str = include_str!("templates/floats.luau");
+const MAPS: &str = include_str!("templates/maps.luau");
 
 const MAX_LOCALS: usize = 200;
 
@@ -128,6 +129,14 @@ fn runtime<'a>(layout: &Layout, schema: &Schema, mode: Mode) -> Vec<Stmt<'a>> {
     if uses(layout, |kind| matches!(kind, LeafKind::Value(Codec::F32 | Codec::F64 { .. }))) {
         out.push(Stmt::Blank);
         out.push(Stmt::Verbatim(FLOATS.into()));
+    }
+    let power = layout.tails.iter().filter_map(|tail| match tail {
+        Tail::Map { count, .. } => Some(map_power(count)),
+        _ => None,
+    });
+    if let Some(power) = power.max().filter(|power| *power > 0) {
+        out.push(Stmt::Blank);
+        out.push(Stmt::Verbatim(MAPS.replace("@MAP_POWER@", &power.to_string()).into()));
     }
     out.push(Stmt::Blank);
     out

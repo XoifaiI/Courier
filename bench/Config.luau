@@ -1,21 +1,21 @@
 --!strict
 
 export type Config = {
-	Run: "Throughput" | "Game" | "Attack",
-	Tools: { string }?,
+	Run: "Throughput" | "Game" | "Attack" | "Cpu",
+	Libraries: { string }?,
+	Tests: { string }?,
 	Seconds: number,
 	Rounds: number,
 	FiresPerFrame: number,
-	CourierCapacity: number,
 }
 
 local Config: Config = {
 	Run = "Throughput",
-	Tools = nil,
-	Seconds = 2,
-	Rounds = 3,
+	Libraries = nil,
+	Tests = nil,
+	Seconds = 1,
+	Rounds = 2,
 	FiresPerFrame = 250,
-	CourierCapacity = 4194304,
 }
 
 return Config

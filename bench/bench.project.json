@@ -15,11 +15,17 @@
 				"Framework": {
 					"$path": "Framework.luau"
 				},
+				"Tests": {
+					"$path": "Tests.luau"
+				},
+				"Scenario": {
+					"$path": "Scenario.luau"
+				},
+				"Libraries": {
+					"$path": "Libraries"
+				},
 				"Runs": {
 					"$path": "Runs"
-				},
-				"Shared": {
-					"$path": "Shared"
 				},
 				"Vendor": {
 					"$path": "vendor"

@@ -4,7 +4,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Stats = game:GetService("Stats")
 
-local Scenario = require("../Shared/Scenario") :: any
+local Framework = require("../Framework")
+local Scenario = require("../Scenario")
 
 local SERVER_SEED = 7
 local CLIENT_SEED = 11
@@ -19,44 +20,14 @@ type Play = {
 	SendKbps: { number },
 }
 
-local function Playable(Framework: any): { string }
-	local Out = {}
-	for _, Tool in Framework.Tools() do
-		if Framework.Mode(Tool).Game then
-			table.insert(Out, Tool)
-		end
-	end
-	return Out
-end
-
-local function Size(Value: any, Depth: number): number
-	local Kind = typeof(Value)
-	if Kind == "buffer" then
-		return buffer.len(Value)
-	elseif Kind == "string" then
-		return #Value
-	elseif Kind == "table" and Depth < 8 then
-		local Total = 0
-		for Key, Field in Value do
-			Total += Size(Key, Depth + 1) + Size(Field, Depth + 1)
-		end
-		return Total
-	elseif Kind == "Vector3" then
-		return 12
-	elseif Kind == "boolean" then
-		return 1
-	end
-	return 4
-end
-
-local function Server(Framework: any)
+local function Server()
 	local Current: Play? = nil
-	local CurrentTool = ""
+	local CurrentLibrary = ""
 
-	for _, Tool in Playable(Framework) do
-		Framework.Mode(Tool).Game.Listen("Input", function(_: Player, Value: any)
+	for _, Name in Framework.Libraries() do
+		Framework.Library(Name).Game.OnInput(function(_: Player, Value: any)
 			local Play = Current
-			if Play == nil or CurrentTool ~= Tool then
+			if Play == nil or CurrentLibrary ~= Name then
 				return
 			end
 			Play.Inputs += 1
@@ -66,22 +37,29 @@ local function Server(Framework: any)
 		end)
 	end
 
-	Framework.Handle("Play", function(Player: Player, Tool: string): Play
-		local Mode = Framework.Mode(Tool).Game
-		local Play: Play =
-			{ Sent = {}, Inputs = 0, BadInputs = 0, SendSeconds = 0, Frames = 0, HeapPeak = gcinfo(), SendKbps = {} }
-		for _, Name in Scenario.SERVER do
-			Play.Sent[Name] = 0
+	Framework.Handle("Play", function(Player: Player, Name: string): Play
+		local Send = Framework.Library(Name).Game.Send
+		local Play: Play = {
+			Sent = {},
+			Inputs = 0,
+			BadInputs = 0,
+			SendSeconds = 0,
+			Frames = 0,
+			HeapPeak = gcinfo(),
+			SendKbps = {},
+		}
+		for _, Message in Scenario.SERVER do
+			Play.Sent[Message] = 0
 		end
 		Current = Play
-		CurrentTool = Tool
+		CurrentLibrary = Name
 		local Next = Scenario.Server(SERVER_SEED)
 		local Tick = Framework.Windows(1)
 		local Elapsed = 0
-		while Elapsed < Framework.Config.Seconds do
+		while Elapsed < Framework.Config.Seconds * 4 do
 			local Before = os.clock()
 			for _, Message in Next() do
-				Mode.Send[Message[1]](Player, Message[2])
+				Send[Message[1]](Player, Message[2])
 				Play.Sent[Message[1]] += 1
 			end
 			Play.SendSeconds += os.clock() - Before
@@ -104,50 +82,46 @@ local function Server(Framework: any)
 	Framework.Handle("Finish", function(): Play?
 		local Play = Current
 		Current = nil
-		CurrentTool = ""
+		CurrentLibrary = ""
 		return Play
 	end)
 end
 
-local function Client(Framework: any)
+local function Client()
 	local RawBytes, RawCalls = 0, 0
 	local Measuring = false
 
-	local function Listen(Item: Instance)
-		if Item:IsA("RemoteEvent") or Item:IsA("UnreliableRemoteEvent") then
-			local Event = (Item :: any).OnClientEvent :: RBXScriptSignal
-			Event:Connect(function(...)
-				if not Measuring then
-					return
-				end
-				RawCalls += 1
-				for Index = 1, select("#", ...) do
-					RawBytes += Size((select(Index, ...)), 0)
-				end
-			end)
+	local function Watch(Item: Instance)
+		if not (Item:IsA("RemoteEvent") or Item:IsA("UnreliableRemoteEvent")) then
+			return
 		end
+		((Item :: any).OnClientEvent :: RBXScriptSignal):Connect(function(...: any)
+			if Measuring then
+				RawCalls += 1
+				RawBytes += Framework.Size(...)
+			end
+		end)
 	end
-
 	for _, Root in { ReplicatedStorage, workspace } :: { Instance } do
 		for _, Item in Root:GetDescendants() do
-			Listen(Item)
+			Watch(Item)
 		end
-		Root.DescendantAdded:Connect(Listen)
+		Root.DescendantAdded:Connect(Watch)
 	end
 
 	local Received: { [string]: number } = {}
 	local Bad = 0
-	local CurrentTool = ""
-	local Tools = Playable(Framework)
+	local CurrentLibrary = ""
 
-	for _, Tool in Tools do
-		for _, Name in Scenario.SERVER do
-			Framework.Mode(Tool).Game.On(Name, function(Value: any)
-				if CurrentTool ~= Tool then
+	for _, Name in Framework.Libraries() do
+		local Game = Framework.Library(Name).Game
+		for _, Message in Scenario.SERVER do
+			Game.On(Message, function(Value: any)
+				if CurrentLibrary ~= Name then
 					return
 				end
-				Received[Name] = (Received[Name] or 0) + 1
-				if not Scenario.Check(Name, Value) then
+				Received[Message] = (Received[Message] or 0) + 1
+				if not Scenario.Check(Message, Value) then
 					Bad += 1
 				end
 			end)
@@ -155,23 +129,23 @@ local function Client(Framework: any)
 	end
 
 	local Results = Framework.Table({
-		"Tool",
-		"Bytes to client per frame",
-		"Remote calls to client per frame",
-		"Server to client Kbps",
-		"Client to server Kbps",
-		"Lost server messages",
+		"Library",
+		"Bytes per frame",
+		"Calls per frame",
+		"Server KB/s",
+		"Client KB/s",
+		"Lost messages",
 		"Lost inputs",
 		"Bad values",
-		"Server send time (us/frame)",
-		"Client heap (MB)",
-		"Server heap peak (MB)",
+		"Server send µs per frame",
+		"Client MB",
+		"Server MB",
 	})
 
-	for _, Tool in Tools do
-		print(`Bench: game with {Tool}`)
-		local Mode = Framework.Mode(Tool).Game
-		CurrentTool = Tool
+	for _, Name in Framework.Libraries() do
+		print(`Bench: game with {Name}`)
+		local Game = Framework.Library(Name).Game
+		CurrentLibrary = Name
 		Received = {}
 		Bad = 0
 		local Send, Heap = {}, {}
@@ -180,7 +154,7 @@ local function Client(Framework: any)
 		local Next = Scenario.Client(CLIENT_SEED)
 		local Connection = RunService.PostSimulation:Connect(function(DeltaTime: number)
 			for _, Message in Next() do
-				Mode.Fire[Message[1]](Message[2])
+				Game.Input(Message[2])
 				Inputs += 1
 			end
 			local _, Kept = Tick(DeltaTime)
@@ -191,31 +165,31 @@ local function Client(Framework: any)
 		end)
 		RawBytes, RawCalls = 0, 0
 		Measuring = true
-		local Played = Framework.Call("Play", Tool)
+		local Played = Framework.Call("Play", Name)
 		Measuring = false
 		Connection:Disconnect()
 		Framework.Drain()
 		local Finished = Framework.Call("Finish")
-		CurrentTool = ""
+		CurrentLibrary = ""
 
 		local Sent, Got = 0, 0
-		for Name, Count in Played.Sent do
+		for Message, Count in Played.Sent do
 			Sent += Count
-			Got += math.min(Received[Name] or 0, Count)
+			Got += math.min(Received[Message] or 0, Count)
 		end
 		local Frames = math.max(Played.Frames, 1)
 		Results.Row(
-			Tool,
+			Name,
 			string.format("%.0f", RawBytes / Frames),
 			string.format("%.2f", RawCalls / Frames),
-			string.format("%.2f", Framework.Median(Played.SendKbps)),
-			string.format("%.2f", Framework.Median(Send)),
+			string.format("%.1f", Framework.Median(Played.SendKbps)),
+			string.format("%.1f", Framework.Median(Send)),
 			`{Sent - Got} of {Sent}`,
 			`{Inputs - Finished.Inputs} of {Inputs}`,
 			tostring(Bad + Finished.BadInputs),
 			string.format("%.0f", Played.SendSeconds / Frames * 1e6),
-			string.format("%.1f", Framework.Median(Heap)),
-			string.format("%.1f", Played.HeapPeak / 1024)
+			string.format("%.0f", Framework.Median(Heap)),
+			string.format("%.0f", Played.HeapPeak / 1024)
 		)
 	end
 

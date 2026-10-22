@@ -1,11 +1,12 @@
 --!strict
 
-local Framework = require("./Framework") :: any
+local Config = require("./Config")
 
-local Runs = {
+local RUNS = {
 	Throughput = require("./Runs/Throughput"),
 	Game = require("./Runs/Game"),
 	Attack = require("./Runs/Attack"),
+	Cpu = require("./Runs/Cpu"),
 }
 
-Runs[Framework.Config.Run].Client(Framework)
+RUNS[Config.Run].Client()

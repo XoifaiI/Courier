@@ -4,9 +4,9 @@ local LogService = game:GetService("LogService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
-local Benches = require("../Shared/Benches") :: any
-local Validate = require("../Shared/Validate") :: any
-local Payloads = require("../Shared/Payloads")
+local Framework = require("../Framework")
+local Payloads = require("@self/Payloads")
+local Validate = require("@self/Validate")
 
 type Payload = Payloads.Payload
 
@@ -77,22 +77,20 @@ local function Worst(Report: Report): string
 	return string.format("%s: +%.1f MB from %.1f KB sent (%.0fx)", Name, Growth / 1024, Sent / 1024, Ratio)
 end
 
-local function Server(Framework: any)
+local function Server()
 	local Owned: { [string]: { Instance } } = {}
 	local Samples: { [Instance]: { Payload } } = {}
 	local Reports: { [string]: Report } = {}
 	local Current: { Phase: string, Tool: string, Category: Category? } = { Phase = "", Tool = "", Category = nil }
 
 	local Baseline = Remotes()
-	for _, Tool in Framework.Tools() do
+	for _, Tool in Framework.Libraries() do
 		local Before = Remotes()
-		local Mode = Framework.Mode(Tool)
+		local Library = Framework.Library(Tool)
 		local Expected = 0
-		for Name in Benches do
-			if not (Mode.Skip and Mode.Skip[Name]) then
-				Expected += 1
-			end
-			Mode.On(Name, function(_: Player, Value: any)
+		for _, Name in Library.Tests do
+			Expected += 1
+			Library.On(Name, function(_: Player, Value: any)
 				if Current.Tool ~= Tool then
 					return
 				end
@@ -242,7 +240,7 @@ local function Server(Framework: any)
 			"Worst allocation",
 		})
 		local Examples: { string } = {}
-		for _, Tool in Framework.Tools() do
+		for _, Tool in Framework.Libraries() do
 			local Report = Reports[Tool]
 			Results.Row(
 				Tool,
@@ -268,7 +266,7 @@ local function Server(Framework: any)
 	end)
 end
 
-local function Client(Framework: any)
+local function Client()
 	local function Frames(Count: number)
 		for _ = 1, Count do
 			RunService.Heartbeat:Wait()
@@ -284,21 +282,19 @@ local function Client(Framework: any)
 		end
 	end
 
-	local function SendEach(Mode: any)
-		for Name, Data in Benches do
-			if not (Mode.Skip and Mode.Skip[Name]) then
-				Mode.Fire[Name](Data)
-				Frames(3)
-			end
+	local function SendEach(Library: Framework.Library)
+		for _, Name in Library.Tests do
+			Library.Fire[Name](Framework.Pool(Name)[1])
+			Frames(3)
 		end
 		Frames(3)
 	end
 
-	for _, Tool in Framework.Tools() do
+	for _, Tool in Framework.Libraries() do
 		print(`Bench: attacking {Tool}`)
-		local Mode = Framework.Mode(Tool)
+		local Library = Framework.Library(Tool)
 		Framework.Call("Phase", "Prime", Tool)
-		SendEach(Mode)
+		SendEach(Library)
 		local Targets = Framework.Call("Samples", Tool) :: { any }
 		for _, Target in Targets do
 			local Rebuilt: { Payload } = {}
@@ -327,7 +323,7 @@ local function Client(Framework: any)
 			task.wait(0.25)
 		end
 		Framework.Call("Phase", "Live", Tool)
-		SendEach(Mode)
+		SendEach(Library)
 		task.wait(0.3)
 		Framework.Call("Phase", "Done", Tool)
 	end

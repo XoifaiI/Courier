@@ -16,3 +16,4 @@
 *.vsix
 
 /bench/vendor/
+/Internal/

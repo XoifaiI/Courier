@@ -1,5 +1,5 @@
-option ClientOutput = "vendor/blink/Client.luau"
-option ServerOutput = "vendor/blink/Server.luau"
+option ClientOutput = "../vendor/blink/Client.luau"
+option ServerOutput = "../vendor/blink/Server.luau"
 
 struct Entity {
     id: u8,

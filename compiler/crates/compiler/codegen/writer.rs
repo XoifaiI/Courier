@@ -3,7 +3,7 @@
 
 use super::emitter::{Base, Emitter};
 use super::types::{enum_table, fields_typed, parameters, screaming};
-use crate::layout::{Chunk, Codec, Count, EventLayout, LeafKind, NodeId, PathId, Tail, bits_for, mask};
+use crate::layout::{Chunk, Codec, Count, EventLayout, Leaf, LeafKind, NodeId, PathId, Tail, bits_for, mask};
 use crate::luau::builtins::*;
 use std::cell::{Cell, RefCell};
 
@@ -12,9 +12,11 @@ use crate::schema::UNION_TAG;
 
 const PACKED_BITS: u32 = 21;
 
-const BOOLS_PER_ADD: u32 = 16;
+const BOOLS_PER_ADD: u32 = 8;
 
 pub const MAX_CHAIN: usize = 8;
+
+pub const F32_LIMIT: f64 = 340_282_356_779_733_661_637_539_395_458_142_568_448.0;
 
 const CARRY: f64 = 1.0 / 4_294_967_296.0;
 
@@ -59,6 +61,7 @@ struct Writer<'e, 'f, 'a> {
     event: &'a str,
     trail: RefCell<Vec<String>>,
     aligned: Cell<bool>,
+    raw_floats: Cell<bool>,
 }
 
 impl<'a> Writer<'_, '_, 'a> {
@@ -219,6 +222,12 @@ impl<'a> Writer<'_, '_, 'a> {
         when(b.eq(b.invoke(BAND, [bits, b.hex(exponent)]), b.hex(exponent)), vec![self.fail(message)])
     }
 
+    fn finite_value(&self, value: ExprId, path: PathId) -> Stmt<'a> {
+        let b = self.e.b;
+        let message = format!("Courier: {} must be a finite number, not NaN or infinity", self.place(path));
+        when(b.not(b.lt(b.invoke(ABS, [value]), b.number(F32_LIMIT))), vec![self.fail(message)])
+    }
+
     fn too_short(&self, count: ExprId, min: u32, path: PathId, unit: &str) -> Stmt<'a> {
         let b = self.e.b;
         let message = format!("Courier: {} has fewer {unit} than its schema minimum of {min}", self.place(path));
@@ -359,6 +368,11 @@ impl<'a> Writer<'_, '_, 'a> {
                         b.invoke(ROUND, [self.clamp(scaled, steps)])
                     }
                     Codec::Enum { id, optional: false } => self.enum_index(id, value, 0, leaf.path),
+                    Codec::F32 if self.raw_floats.get() => {
+                        out.push(number(locals.leaves[slot], value));
+                        out.push(self.finite_value(b.name(locals.leaves[slot]), leaf.path));
+                        continue;
+                    }
                     Codec::F32 => {
                         out.push(number(locals.leaves[slot], b.invoke("F32Bits", [value])));
                         out.push(self.finite(b.name(locals.leaves[slot]), 0x7F80_0000, leaf.path));
@@ -607,9 +621,17 @@ impl<'a> Writer<'_, '_, 'a> {
                     let (held_key, held_value) = (e.temp('K'), e.temp('X'));
                     e.bind(e.layout.node(*key).base, Base::Local(held_key));
                     e.bind(e.layout.node(*value).base, Base::Local(held_value));
+                    let iterable = vec![b.fixed("next"), b.cast(e.read(*path), "any")];
+                    if self.packable(&[*key, *value]) {
+                        let total = locals.count(e, index, count);
+                        let entries = [(*key, "[key]."), (*value, "[value].")];
+                        out.extend(self.packed_bytes(*path, &entries, total, |body| {
+                            Stmt::ForIn(vec![held_key, held_value], iterable.clone(), body)
+                        }));
+                        continue;
+                    }
                     let mut body = self.within(*path, "[key].", || self.node_body(*key, true));
                     body.extend(self.within(*path, "[value].", || self.node_body(*value, true)));
-                    let iterable = vec![b.fixed("next"), b.cast(e.read(*path), "any")];
                     out.push(Stmt::ForIn(vec![held_key, held_value], iterable, body));
                 }
                 Tail::Bytes { path, count, buffer } => {
@@ -673,12 +695,20 @@ impl<'a> Writer<'_, '_, 'a> {
             out.extend(self.bool_array(e.read(path), total));
             return out;
         }
-        if let Some(write) = self.whole_write(element) {
-            out.extend(self.whole_array(element, write, total, position, body));
+        if let Some(writes) = self.whole_writes(element) {
+            out.extend(self.whole_array(element, &writes, total, position, body));
             return out;
         }
         if flat && element_node.bits > 0 && element_node.bits <= PACKED_BITS && !self.aligned.get() {
             out.extend(self.packed_array(element, total, position, body));
+            return out;
+        }
+        if !flat && self.packable(&[element]) {
+            out.extend(self.packed_bytes(path, &[(element, "")], total, |items| {
+                let mut each = body;
+                each.extend(items);
+                Stmt::For(position, b.number(1), total, each)
+            }));
             return out;
         }
         body.extend(self.node_body(element, !flat));
@@ -686,34 +716,113 @@ impl<'a> Writer<'_, '_, 'a> {
         out
     }
 
-    fn whole_write(&self, element: NodeId) -> Option<&'static str> {
+    fn packable(&self, nodes: &[NodeId]) -> bool {
         let layout = self.e.layout;
-        let leaves = layout.leaves(element);
+        let bits: u32 = nodes.iter().map(|node| layout.node(*node).bits).sum();
+        bits <= PACKED_BITS
+            && nodes.iter().all(|node| {
+                layout.groups(*node).is_empty()
+                    && layout.tails(*node).iter().all(|tail| match tail {
+                        Tail::Bytes { count, .. } => !matches!(count, Count::Coded { .. }),
+                        _ => false,
+                    })
+            })
+    }
+
+    fn packed_bytes(
+        &self,
+        path: PathId,
+        nodes: &[(NodeId, &str)],
+        total: ExprId,
+        iterate: impl FnOnce(Block<'a>) -> Stmt<'a>,
+    ) -> Block<'a> {
+        let (e, b) = (self.e, self.e.b);
+        let bits: u32 = nodes.iter().map(|(node, _)| e.layout.node(*node).bits).sum();
+        let end = e.temp('H');
+        let names = [e.temp('B'), e.temp('F'), e.temp('G'), e.temp('Q')];
+        let [byte, fill, scale, acc] = names;
+        let again = || vec![Stmt::Return(vec![self.again])];
+        let mut item = Vec::new();
+        let mut terms = Vec::new();
+        let mut shift = 0;
+        for &(node, step) in nodes {
+            let node_bits = e.layout.node(node).bits;
+            item.extend(self.within(path, step, || {
+                e.scope(e.layout.node(node).base, || {
+                    let locals = Locals::new(e, node);
+                    let mut out = self.early(node, &locals);
+                    out.extend(self.counts(node, &locals));
+                    out.extend(self.stores(node, &locals));
+                    if node_bits > 0 {
+                        let held = e.temp('W');
+                        out.push(number(held, self.words(node, &locals, None).swap_remove(0)));
+                        let weight = (1u64 << shift) as f64;
+                        terms.push(if shift == 0 { b.name(held) } else { b.mul(b.name(held), b.number(weight)) });
+                    }
+                    for (index, tail) in e.layout.tails(node).iter().enumerate() {
+                        let Tail::Bytes { path, count, buffer } = tail else { continue };
+                        if matches!(count, Count::Fixed(0)) {
+                            continue;
+                        }
+                        let length = locals.count(e, index, count);
+                        let lower = vec![
+                            decrease(b.fixed("Top"), length),
+                            assign(b.fixed("Limit"), b.sub(b.mul(b.fixed("Top"), b.number(8)), b.fixed("GAP"))),
+                        ];
+                        match count {
+                            Count::Fixed(_) => out.extend(lower),
+                            _ => out.push(when(b.gt(length, b.number(0)), lower)),
+                        }
+                        out.push(when(b.gt(b.name(end), b.fixed("Limit")), again()));
+                        let copy = if *buffer {
+                            b.invoke(COPY, [self.stream(), b.fixed("Top"), e.read(*path), b.number(0), length])
+                        } else {
+                            b.invoke(WRITESTRING, [self.stream(), b.fixed("Top"), e.read(*path), length])
+                        };
+                        out.push(Stmt::Call(copy));
+                    }
+                    out
+                })
+            }));
+            shift += node_bits;
+        }
+        let mut out = vec![
+            local(end, b.add(self.cursor(), b.mul(total, b.number(bits)))),
+            when(b.gt(b.name(end), b.fixed("Limit")), again()),
+        ];
+        if bits == 0 {
+            out.push(iterate(item));
+            return out;
+        }
+        item.extend(self.accumulate(names, b.sum(terms), b.number((1u64 << bits) as f64), b.number(bits)));
+        let kept = b.invoke(BAND, [b.invoke(READU8, [self.stream(), b.name(byte)]), b.sub(b.name(scale), b.number(1))]);
+        out.push(Stmt::Do(vec![
+            local(byte, b.floor_div(self.cursor(), b.number(8))),
+            local(fill, b.invoke(BAND, [self.cursor(), b.number(7)])),
+            local(scale, b.invoke(LSHIFT, [b.number(1), b.name(fill)])),
+            local(acc, kept),
+            iterate(item),
+            Stmt::Call(b.invoke(WRITEU32, [self.stream(), b.name(byte), b.name(acc)])),
+        ]));
+        out.push(assign(self.cursor(), b.name(end)));
+        out
+    }
+
+    fn whole_writes(&self, element: NodeId) -> Option<Vec<&'static str>> {
+        let layout = self.e.layout;
         if !self.aligned.get() || !layout.tails(element).is_empty() || !layout.groups(element).is_empty() {
             return None;
         }
-        match leaves {
-            [leaf]
-                if leaf.is_placed()
-                    && !leaf.is_flag()
-                    && leaf.position == 0
-                    && leaf.bits == layout.node(element).bits =>
-            {
-                match leaf.bits {
-                    8 => Some(WRITEU8),
-                    16 => Some(WRITEU16),
-                    32 => Some(WRITEU32),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        let leaves = layout.leaves(element);
+        let writes = leaves.iter().map(direct_write).collect::<Option<Vec<_>>>()?;
+        let floats = leaves.iter().any(|leaf| matches!(leaf.kind, LeafKind::Value(Codec::F32)));
+        (leaves.len() == 1 || floats).then_some(writes)
     }
 
     fn whole_array(
         &self,
         element: NodeId,
-        write: &'static str,
+        writes: &[&'static str],
         total: ExprId,
         position: Name<'a>,
         prefix: Block<'a>,
@@ -725,8 +834,17 @@ impl<'a> Writer<'_, '_, 'a> {
         body.extend(e.scope(e.layout.node(element).base, || {
             let locals = Locals::new(e, element);
             let mut out = self.early(element, &locals);
+            self.raw_floats.set(true);
             out.extend(self.stores(element, &locals));
-            out.push(Stmt::Call(b.invoke(write, [self.stream(), b.name(byte), b.name(locals.leaves[0])])));
+            self.raw_floats.set(false);
+            let leaves = e.layout.leaves(element);
+            let mut order: Vec<usize> = (0..leaves.len()).collect();
+            order.sort_by_key(|slot| std::cmp::Reverse(leaves[*slot].position));
+            for slot in order {
+                let offset = leaves[slot].position / 8;
+                let at = if offset == 0 { b.name(byte) } else { b.add(b.name(byte), b.number(offset)) };
+                out.push(Stmt::Call(b.invoke(writes[slot], [self.stream(), at, b.name(locals.leaves[slot])])));
+            }
             out.push(increase(b.name(byte), b.number(bytes)));
             out
         }));
@@ -992,6 +1110,20 @@ impl<'a> Writer<'_, '_, 'a> {
     }
 }
 
+fn direct_write(leaf: &Leaf) -> Option<&'static str> {
+    if !leaf.is_placed() || leaf.is_flag() || !leaf.position.is_multiple_of(8) {
+        return None;
+    }
+    match (leaf.kind, leaf.bits) {
+        (LeafKind::Value(Codec::F32), _) => Some(WRITEF32),
+        (LeafKind::Value(Codec::F64 { .. }), _) => None,
+        (_, 8) => Some(WRITEU8),
+        (_, 16) => Some(WRITEU16),
+        (_, 32) => Some(WRITEU32),
+        _ => None,
+    }
+}
+
 pub fn count_max(count: &Count) -> Option<u32> {
     match *count {
         Count::Fixed(fixed) => Some(fixed),
@@ -1032,7 +1164,14 @@ pub fn writer<'a>(e: &Emitter<'_, 'a>, event: &EventLayout, spilled: bool) -> St
     let mut arguments = vec![e.b.fixed("Stream"), callee];
     arguments.extend(signature[1..].iter().map(|parameter| e.b.name(parameter.name)));
     let again = e.b.invoke("Overflow", arguments);
-    let writer = Writer { e, again, event: &declared.name, trail: RefCell::new(Vec::new()), aligned: Cell::new(false) };
+    let writer = Writer {
+        e,
+        again,
+        event: &declared.name,
+        trail: RefCell::new(Vec::new()),
+        aligned: Cell::new(false),
+        raw_floats: Cell::new(false),
+    };
     let mut body = e.scope(base, || writer.message(event));
     e.hoist(&mut body);
     Stmt::Function {

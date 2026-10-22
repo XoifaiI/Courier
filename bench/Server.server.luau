@@ -2,12 +2,13 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Framework = require(ReplicatedStorage.Bench.Framework) :: any
+local Config = require(ReplicatedStorage.Bench.Config)
 
-local Runs = {
+local RUNS = {
 	Throughput = require(ReplicatedStorage.Bench.Runs.Throughput),
 	Game = require(ReplicatedStorage.Bench.Runs.Game),
 	Attack = require(ReplicatedStorage.Bench.Runs.Attack),
+	Cpu = require(ReplicatedStorage.Bench.Runs.Cpu),
 }
 
-Runs[Framework.Config.Run].Server(Framework)
+RUNS[Config.Run].Server()

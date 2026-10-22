@@ -27,12 +27,11 @@ cp -r "$WORK/lync/src" vendor/lync
 cp "$WORK/lync/LICENSE" vendor/lync.LICENSE
 
 Clone breadboardengineer1234/QuickNet quicknet "$QUICKNET_COMMIT"
-rm -rf vendor/quicknet vendor/quicknet-raised
+rm -rf vendor/quicknet
 cp -r "$WORK/quicknet/src" vendor/quicknet
 cp "$WORK/quicknet/LICENSE" vendor/quicknet.LICENSE
-cp -r vendor/quicknet vendor/quicknet-raised
 sed -i -e 's/MaxCallsPerFrame = 100,/MaxCallsPerFrame = 65535,/' \
-	-e 's/MaxPacketSize = 50000,/MaxPacketSize = 2000000,/' vendor/quicknet-raised/Config.luau
+	-e 's/MaxPacketSize = 50000,/MaxPacketSize = 2000000,/' vendor/quicknet/Config.luau
 
 Clone Data-Oriented-House/Squash squash "$SQUASH_VERSION"
 rm -rf vendor/squash
@@ -78,36 +77,35 @@ cp "$WORK/lemonsignal/LICENSE" vendor/paknet-lemonsignal.LICENSE
 cp "$WORK/typed-promise/LICENSE" vendor/paknet-typed-promise.LICENSE
 cp "$WORK/promise/LICENSE" vendor/paknet-promise.LICENSE
 
-rm -rf vendor/packet-raised
 if [ -d vendor/packet ]; then
-	cp -r vendor/packet vendor/packet-raised
-	sed -i 's/if bytes > 8_000 then/if bytes > 2_000_000_000 then/' vendor/packet-raised/init.luau
+	sed -i 's/if bytes > 8_000 then/if bytes > 2_000_000_000 then/' vendor/packet/init.luau
 else
-	echo "vendor/packet is missing, so Packet and PacketRaised will not load; see the note at the top"
+	echo "vendor/packet is missing, so Packet is left out"
 fi
 
 gh release download "$BLINK_VERSION" --repo 1Axen/blink -p "blink-windows-x86_64.tar.gz" -D "$WORK"
 tar xzf "$WORK/blink-windows-x86_64.tar.gz" -C "$WORK"
-"$WORK/blink.exe" Bench.blink -y -q
+rm -rf vendor/blink
+(cd schemas && "$WORK/blink.exe" Bench.blink -y -q)
 
 gh release download "$BLINKBLOX_VERSION" --repo XopoIII/BlinkBlox -p "blinkblox-windows-x86_64.tar.gz" -D "$WORK"
 tar xzf "$WORK/blinkblox-windows-x86_64.tar.gz" -C "$WORK"
 rm -rf vendor/blinkblox
-"$WORK/blinkblox.exe" Bench.blinkblox. -y -q
+(cd schemas && "$WORK/blinkblox.exe" Bench.blinkblox. -y -q)
 curl -fsSL "https://raw.githubusercontent.com/XopoIII/BlinkBlox/$BLINKBLOX_VERSION/LICENSE" -o vendor/blinkblox.LICENSE
 
 gh release download "$ZAP_VERSION" --repo red-blox/zap -p "zap-${ZAP_VERSION#v}-windows-x86_64.zip" -D "$WORK"
 unzip -q "$WORK/zap-${ZAP_VERSION#v}-windows-x86_64.zip" -d "$WORK"
 rm -rf vendor/zap
-"$WORK/zap.exe" Bench.zap
+(cd schemas && "$WORK/zap.exe" Bench.zap)
 gh api "repos/red-blox/zap/contents/LICENSE?ref=$ZAP_VERSION" -H "Accept: application/vnd.github.raw" > vendor/zap.LICENSE
 
 git clone --quiet --depth 1 --branch "$NETRAY_VERSION" https://github.com/AstaWasTaken/NetRay-Compile.git "$WORK/netray"
 gh release download "$NETRAY_VERSION" --repo AstaWasTaken/NetRay-Compile -p "NetRay-Compile-windows-x86_64.zip" -D "$WORK"
 unzip -q "$WORK/NetRay-Compile-windows-x86_64.zip" -d "$WORK"
 rm -rf vendor/netraycompile
-"$WORK/NetRay-Compile.exe" compile Bench.idl --out-dir vendor/netraycompile --scope NetRayCompile
+"$WORK/NetRay-Compile.exe" compile schemas/Bench.idl --out-dir vendor/netraycompile --scope NetRayCompile
 cp "$WORK/netray/LICENSE" vendor/netraycompile.LICENSE
 
-../compiler/target/release/courier.exe --runtime 'game:GetService("ReplicatedStorage"):WaitForChild("Courier")' Bench.courier vendor/net
+../compiler/target/release/courier.exe --runtime 'game:GetService("ReplicatedStorage"):WaitForChild("Courier")' schemas/Bench.courier vendor/net
 rm -rf "$WORK"

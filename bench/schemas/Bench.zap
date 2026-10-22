@@ -1,6 +1,5 @@
-opt client_output = "vendor/zap/Client.luau"
-opt server_output = "vendor/zap/Server.luau"
-opt write_checks = false
+opt client_output = "../vendor/zap/Client.luau"
+opt server_output = "../vendor/zap/Server.luau"
 
 type Entity = struct {
 	id: u8,

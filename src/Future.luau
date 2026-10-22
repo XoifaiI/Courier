@@ -2,13 +2,13 @@
 --!optimize 2
 
 --[=[
-	Future: a call running on its own thread that you can wait on
+	Future: a call whose results you can wait on, and the reused thread Courier runs handlers on
 
 	Wait gives you the results, or nothing if it timed out or was cancelled. Happened means it
 	finished without an error, and Cancelled gives you the error if there was one
 
-	Return type: New, IsFuture, FromWeakFuture, and Completed, Cancelled and Errored for Futures
-	that have already ended
+	Return type: New, Pending, Spawn, IsFuture, FromWeakFuture, and Completed, Cancelled and Errored
+	for Futures that have already ended
 	Example usage:
 		local Done = Future.New(function()
 			return 1
@@ -25,6 +25,7 @@ local Pack = table.pack :: (...any) -> Packed
 
 local HASNT_HAPPENED = "Future hasn't happened yet"
 local ALREADY_HAPPENED = "Future already happened or was cancelled"
+local TIMED_OUT = "Future timed out"
 
 local Future = {}
 Future.__index = Future
@@ -36,11 +37,40 @@ type Private<T...> = {
 	Waiting: { thread },
 	Timeouts: { thread },
 
-	Thread: thread,
+	Thread: thread?,
 }
 
 type FutureReference<T...> = setmetatable<{ Inst: Future<T...> }, { __mode: "v" }>
 type TimeoutReference<T...> = setmetatable<{ Inst: Future<T...>, Caller: thread }, { __mode: "v" }>
+
+local FreeThread: thread? = nil
+
+local function RunHandler(Handler: (...any) -> (), ...: any)
+	local Acquired = FreeThread
+	FreeThread = nil
+	Handler(...)
+	FreeThread = Acquired
+end
+
+local function Runner()
+	while true do
+		RunHandler(coroutine.yield())
+	end
+end
+
+local function Spawn(Handler: (...any) -> (), ...: any): thread
+	if FreeThread == nil then
+		local Created = coroutine.create(Runner)
+		coroutine.resume(Created)
+		FreeThread = Created
+	end
+	local Thread = FreeThread :: thread
+	local Resumed, Problem = coroutine.resume(Thread, Handler, ...)
+	if not Resumed then
+		task.spawn(error, debug.traceback(Thread, Problem), 0)
+	end
+	return Thread
+end
 
 local function TryRemove(Table: any, Value: any): boolean
 	local Position = table.find(Table, Value)
@@ -80,22 +110,23 @@ local function Finish<T...>(self: Private<T...>, ...)
 		task.cancel(TimeoutThread)
 	end
 
-	for _, WaitingThread in self.Waiting do
+	local Waiting = self.Waiting
+	self.Waiting = {}
+	table.clear(self.Timeouts)
+
+	for _, WaitingThread in Waiting do
 		if coroutine.status(WaitingThread) ~= "suspended" then
 			continue
 		end
 
-		coroutine.resume(WaitingThread, ...)
+		task.spawn(WaitingThread, ...)
 	end
-
-	table.clear(self.Waiting)
-	table.clear(self.Timeouts)
 end
 
 local function FutureIsHappening<T...>(self: Future<T...>): boolean
 	local Private = ToPrivate(self)
 
-	return not Private.WasCancelled and Private.Thread and coroutine.status(Private.Thread) == "suspended"
+	return Private.Result == nil and not Private.WasCancelled
 end
 
 local function TryConsume<T...>(self: Private<T...>)
@@ -107,18 +138,25 @@ local function TryConsume<T...>(self: Private<T...>)
 	end
 end
 
+local function Settle<T...>(self: Private<T...>, ...: any)
+	if self.Result ~= nil or self.WasCancelled then
+		return
+	end
+
+	self.Result = Pack(...)
+	self.Thread = nil
+	TryConsume(self)
+
+	Finish(self, Unpack(self))
+end
+
 local function FutureTask<Args..., Ret...>(Callback: (Args...) -> Ret..., Reference: FutureReference<Ret...>, ...: Args...)
 	local Inst = Reference.Inst
 	if not Inst then
 		return
 	end
 
-	local Private = ToPrivate(Inst)
-
-	Private.Result = Pack(pcall(Callback, ...))
-	TryConsume(Private)
-
-	Finish(Private, Unpack(Private))
+	Settle(ToPrivate(Inst), pcall(Callback, ...))
 end
 
 local function TimeoutTask<T...>(Reference: TimeoutReference<T...>)
@@ -155,20 +193,50 @@ local function TimeoutTask<T...>(Reference: TimeoutReference<T...>)
 		Inst:Cancel()
 	end
 
-	coroutine.resume(Caller)
+	task.spawn(Caller)
+end
+
+local function NewBody<T...>(): (Private<T...>, Future<T...>)
+	local Body = { WasCancelled = false, Waiting = {}, Timeouts = {} } :: Private<T...>
+	return Body, setmetatable(Body :: any, Future) :: any
 end
 
 local function New<Args..., Ret...>(Callback: (Args...) -> Ret..., ...: Args...): Future<Ret...>
-	local Body = { WasCancelled = false, Waiting = {}, Timeouts = {} } :: Private<Ret...>
-	local NewFuture: Future<Ret...> = setmetatable(Body :: any, Future) :: any
+	local Body, NewFuture = NewBody()
 
 	local WeakReference: FutureReference<Ret...> = setmetatable({
 		Inst = NewFuture,
 		Caller = nil,
 	}, { __mode = "v" })
-	Body.Thread = task.spawn(FutureTask, Callback, WeakReference, ...)
+	local Thread = Spawn(FutureTask, Callback, WeakReference, ...)
+	if FutureIsHappening(NewFuture) then
+		Body.Thread = Thread
+	end
 
 	return NewFuture
+end
+
+local function Pending<T...>(Timeout: number?, OnTimeout: (() -> ())?): (Future<T...>, (Success: boolean, ...any) -> ())
+	local Body, NewFuture = NewBody()
+	local Timer: thread? = nil
+
+	local function Done(...: any)
+		if Timer and coroutine.status(Timer) == "suspended" then
+			task.cancel(Timer)
+		end
+		Settle(Body, ...)
+	end
+
+	if Timeout then
+		Timer = task.delay(Timeout, function()
+			if OnTimeout then
+				OnTimeout()
+			end
+			Settle(Body, false, TIMED_OUT)
+		end)
+	end
+
+	return NewFuture, Done
 end
 
 function Future.Wait<T...>(self: Future<T...>, Timeout: number?): T...
@@ -199,7 +267,8 @@ function Future.Cancel<T...>(self: Future<T...>): ()
 	Finish(Private)
 
 	local Thread = Private.Thread
-	if Thread and coroutine.status(Thread) == "suspended" then
+	Private.Thread = nil
+	if Thread and Thread ~= coroutine.running() and coroutine.status(Thread) == "suspended" then
 		task.cancel(Thread)
 	end
 end
@@ -290,6 +359,8 @@ end
 table.freeze(Future)
 return table.freeze({
 	New = New,
+	Pending = Pending,
+	Spawn = Spawn,
 	IsFuture = IsFuture,
 	FromWeakFuture = FromWeakFuture,
 

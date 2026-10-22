@@ -7,7 +7,9 @@ use std::cell::Cell;
 use super::emitter::Emitter;
 use super::module::Mode;
 use super::types::enum_table;
-use super::writer::{chunk_bits, chunk_table, count_max};
+use super::writer::{F32_LIMIT, chunk_bits, chunk_table, count_max};
+
+const MAP_POWER: u32 = 10;
 use crate::layout::{
     Chunk, Codec, Count, Direction, EventLayout, Layout, Leaf, LeafKind, LeafSlot, NodeId, Shape, ShapeId, Tail, mask,
 };
@@ -70,6 +72,10 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
     }
 
     fn non_finite(&self, leaf: &Leaf, bits: ExprId) -> Option<ExprId> {
+        if self.direct(leaf) == Some(READF32) {
+            let b = self.e.b;
+            return Some(b.not(b.lt(b.invoke(ABS, [bits]), b.number(F32_LIMIT))));
+        }
         let exponent = match leaf.kind {
             LeafKind::Value(Codec::F32) => 0x7F80_0000,
             LeafKind::Value(Codec::F64 { high: true }) => 0x7FF0_0000,
@@ -93,6 +99,12 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
 
     fn direct(&self, leaf: &Leaf) -> Option<&'static str> {
         if !self.aligned.get() || !leaf.is_placed() || leaf.is_flag() || !leaf.position.is_multiple_of(8) {
+            return None;
+        }
+        if matches!(leaf.kind, LeafKind::Value(Codec::F32)) {
+            return Some(READF32);
+        }
+        if matches!(leaf.kind, LeafKind::Value(Codec::F64 { .. })) {
             return None;
         }
         match leaf.bits {
@@ -265,6 +277,7 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                 let value = b.if_else(b.eq(stored, b.number(0)), b.nil(), b.index(self.enum_table(id), stored));
                 b.cast(value, format!("{}?", self.e.schema.enumeration(id).name))
             }
+            LeafKind::Value(Codec::F32) if self.direct(leaf).is_some() => stored,
             LeafKind::Value(Codec::F32) => b.invoke("BitsF32", [stored]),
             LeafKind::Tag { .. }
             | LeafKind::Rotation { .. }
@@ -405,6 +418,67 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         self.tails_read(node, locals, out);
     }
 
+    fn map_table(&self, count: &Count, total: ExprId) -> ExprId {
+        let b = self.e.b;
+        let power = map_power(count);
+        if power == 0 {
+            return b.table([], false);
+        }
+        let template = |index: ExprId| b.invoke(TABLE_CLONE, [b.index(b.fixed("MAP_TEMPLATES"), index)]);
+        if let Count::Fixed(fixed) = *count {
+            return template(b.number(power.min(ceil_log2(fixed))));
+        }
+        let mut index = b.sub(b.number(32), b.invoke(COUNTLZ, [b.sub(total, b.number(1))]));
+        if count_max(count).is_none_or(|max| max > 1 << power) {
+            index = b.invoke(MIN, [index, b.number(power)]);
+        }
+        b.if_else(b.gt(total, b.number(1)), template(index), b.table([], false))
+    }
+
+    fn pair_read(&self, key: NodeId, value: NodeId, out: &mut Block<'a>) -> Option<(ExprId, ExprId)> {
+        let (e, b) = (self.e, self.e.b);
+        let key_bits = e.layout.node(key).bits;
+        let bits = key_bits + e.layout.node(value).bits;
+        let plain = |node: NodeId| {
+            e.layout.groups(node).is_empty() && e.layout.leaves(node).iter().all(|leaf| leaf.is_placed())
+        };
+        if bits == 0 || bits > 25 || !plain(key) || !plain(value) {
+            return None;
+        }
+        let (key_locals, value_locals) = (self.locals(key), self.locals(value));
+        let pairs = |node: NodeId, locals: &Locals<'a>| {
+            e.layout.leaves(node).iter().copied().zip(locals.leaves.clone()).collect::<Vec<_>>()
+        };
+        let (key_leaves, value_leaves) = (pairs(key, &key_locals), pairs(value, &value_locals));
+        let declared = key_leaves.iter().chain(&value_leaves).map(|(leaf, name)| (*name, self.leaf_type(leaf)));
+        out.push(Stmt::Declare(declared.collect()));
+        let mut body = vec![
+            local(Name::Fixed("Byte"), b.floor_div(self.cursor(), b.number(8))),
+            local(Name::Fixed("Shift"), b.invoke(BAND, [self.cursor(), b.number(7)])),
+            local(
+                Name::Temp('W', 0),
+                b.invoke(RSHIFT, [b.invoke(READU32, [self.source(), b.fixed("Byte")]), b.fixed("Shift")]),
+            ),
+        ];
+        for (leaf, name) in key_leaves {
+            body.extend(self.leaf_assign(&leaf, name));
+        }
+        for (leaf, name) in value_leaves {
+            let shifted = Leaf { position: leaf.position + key_bits, ..leaf };
+            body.extend(self.leaf_assign(&shifted, name));
+        }
+        out.push(Stmt::Do(body));
+        out.push(increase(self.cursor(), b.number(bits)));
+        self.tails_read(key, &key_locals, out);
+        self.tails_read(value, &value_locals, out);
+        let shape = |node: NodeId, locals: &Locals<'a>| {
+            let leaves = self.names(&locals.leaves);
+            let tails = self.names(&locals.tails);
+            self.shape_value(e.layout.node(node).shape, &leaves, &tails, None)
+        };
+        Some((shape(key, &key_locals), shape(value, &value_locals)))
+    }
+
     fn tails_read(&self, node: NodeId, locals: &Locals<'a>, out: &mut Block<'a>) {
         let (e, b) = (self.e, self.e.b);
         for (tail, held) in e.layout.tails(node).iter().zip(&locals.tails) {
@@ -422,14 +496,23 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                     let entry_bits = e.layout.node(*key).min_bits + e.layout.node(*value).min_bits;
                     let room = b.sub(self.bit_limit(), self.cursor());
                     out.push(when(b.gt(b.mul(total, b.number(entry_bits)), room), vec![self.refuse()]));
-                    out.push(local(held, b.cast(b.table([], false), "any")));
+                    out.push(local(held, b.cast(self.map_table(count, total), "any")));
                     let outer = self.head_end.get();
                     let hoisted = self.hoist(&[*key, *value], total, out);
                     let mut body = Vec::new();
-                    let read_key = self.node_read(*key, !hoisted, None, &mut body);
                     let key_held = e.temp('K');
-                    body.push(local(key_held, read_key));
-                    let read_value = self.node_read(*value, !hoisted, None, &mut body);
+                    let paired = if hoisted { self.pair_read(*key, *value, &mut body) } else { None };
+                    let read_value = match paired {
+                        Some((read_key, read_value)) => {
+                            body.push(local(key_held, read_key));
+                            read_value
+                        }
+                        None => {
+                            let read_key = self.node_read(*key, !hoisted, None, &mut body);
+                            body.push(local(key_held, read_key));
+                            self.node_read(*value, !hoisted, None, &mut body)
+                        }
+                    };
                     self.head_end.set(outer);
                     let target = b.index(b.name(held), b.name(key_held));
                     if self.bare_instance(*value) {
@@ -1047,6 +1130,18 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         out.push(Stmt::Function { name: Name::Fixed(function), parameters, returns: "boolean".into(), body });
         out.push(Stmt::Blank);
         out
+    }
+}
+
+fn ceil_log2(value: u32) -> u32 {
+    32 - (value - 1).leading_zeros()
+}
+
+pub fn map_power(count: &Count) -> u32 {
+    match count_max(count) {
+        Some(max) if max <= 1 => 0,
+        Some(max) => ceil_log2(max).min(MAP_POWER),
+        None => MAP_POWER,
     }
 }
 

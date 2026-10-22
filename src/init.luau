@@ -23,6 +23,8 @@ local Types = require("@self/Types")
 local Future = require("@self/Future")
 local Result = require("@self/Result")
 
+local Spawn = Future.Spawn
+
 type Call = Types.Call
 type Config = Types.Config
 type Event = Types.Event
@@ -31,6 +33,7 @@ type MiddlewareCallback<T> = Types.MiddlewareCallback<T>
 type Reply = Types.Reply
 type Schema = Types.Schema
 type Stream = Types.Stream
+type Done = (Success: boolean, ...any) -> ()
 
 export type Future<T...> = Types.Future<T...>
 export type Middleware<T> = Types.Middleware<T>
@@ -60,38 +63,15 @@ local ClientStreams: { Stream } = {}
 local StreamOwner: { [Stream]: Player } = {}
 local StreamReliable: { [Stream]: boolean } = {}
 
-local PendingByPlayer: { [Player]: { [number]: thread } } = {}
+local PendingByPlayer: { [Player]: { [number]: Done } } = {}
 local PlayerMetadata: { [Player]: Metadata } = {}
-local ClientPending: { [number]: thread } = {}
+local ClientPending: { [number]: Done } = {}
 local NextCallId = 0
 
-local FreeThread: thread? = nil
 local SUCCESS = Result.SUCCESS
 local CLIENT_METADATA: Metadata = table.freeze({ Origin = "Server", Direction = "Inbound" } :: Metadata)
 local Rejections: { [any]: Types.Result<any, any> } = setmetatable({}, { __mode = "v" }) :: any
 local WarnedFrameSize = false
-
-local function RunHandler(Handler: (...any) -> (), ...: any)
-	local Acquired = FreeThread
-	FreeThread = nil
-	Handler(...)
-	FreeThread = Acquired
-end
-
-local function Runner()
-	while true do
-		RunHandler(coroutine.yield())
-	end
-end
-
-local function Spawn(Handler: (...any) -> (), ...: any)
-	if FreeThread == nil then
-		local Created = coroutine.create(Runner)
-		coroutine.resume(Created)
-		FreeThread = Created
-	end
-	task.spawn(FreeThread :: thread, Handler, ...)
-end
 
 local function DeepCopy<T>(Target: T): T
 	local Source: any = Target
@@ -106,16 +86,6 @@ local function DeepCopy<T>(Target: T): T
 	return Copy :: any
 end
 
-local function Settle(Timeout: thread, Success: boolean, ...: any): ...any
-	if coroutine.status(Timeout) == "suspended" then
-		task.cancel(Timeout)
-	end
-	if not Success then
-		error((...), 0)
-	end
-	return ...
-end
-
 local function SendResults(Reply: Reply, Name: string, Sender: Player?, CallId: number, Success: boolean, ...: any)
 	if Success then
 		Reply(Sender, CallId, true, ...)
@@ -125,7 +95,7 @@ local function SendResults(Reply: Reply, Name: string, Sender: Player?, CallId: 
 	Reply(Sender, CallId, false, "the handler failed")
 end
 
-local function PendingFor(Peer: Player?): { [number]: thread }?
+local function PendingFor(Peer: Player?): { [number]: Done }?
 	if Peer then
 		return PendingByPlayer[Peer]
 	end
@@ -138,16 +108,6 @@ local function MetadataFor(Sender: Player?): Metadata
 	end
 	return PlayerMetadata[Sender]
 		or table.freeze({ Origin = "Client", Player = Sender, Direction = "Inbound" } :: Metadata)
-end
-
-local function Fail(Pending: { [number]: thread }, CallId: number, Thread: thread, Reason: string)
-	if Pending[CallId] ~= Thread then
-		return
-	end
-	Pending[CallId] = nil
-	if coroutine.status(Thread) == "suspended" then
-		task.spawn(Thread, false, Reason)
-	end
 end
 
 local function Send(Stream: Stream)
@@ -258,8 +218,8 @@ local function RemovePlayer(Player: Player)
 	PendingByPlayer[Player] = nil
 	PlayerMetadata[Player] = nil
 	if Pending then
-		for CallId, Thread in Pending do
-			Fail(Pending, CallId, Thread, "the player left")
+		for _, Settled in Pending do
+			Settled(false, "the player left")
 		end
 	end
 end
@@ -395,25 +355,30 @@ function Courier.Event(Name: string, Count: number): Event
 end
 
 function Courier.Invoke(Peer: Player?, Write: (CallId: number) -> ()): Future<...any>
-	return Future.New(function(): ...any
-		local Pending = PendingFor(Peer)
-		if Pending == nil then
-			error("Courier: the player left before the call was sent", 0)
+	local Pending = PendingFor(Peer)
+	if Pending == nil then
+		return Future.Errored("Courier: the player left before the call was sent")
+	end
+
+	local CallId = NextCallId
+	NextCallId = bit32.band(CallId + 1, 0xFFFF)
+	if Pending[CallId] ~= nil then
+		return Future.Errored("Courier: 65536 calls are already waiting for results, so this one was not sent")
+	end
+
+	local Job: Future<...any>, Settled: Done
+	Job, Settled = Future.Pending(Courier.Config.InvokeTimeout, function()
+		if Pending[CallId] == Settled then
+			Pending[CallId] = nil
 		end
-
-		local CallId = NextCallId
-		NextCallId = bit32.band(CallId + 1, 0xFFFF)
-		if Pending[CallId] ~= nil then
-			error("Courier: 65536 calls are already waiting for results, so this one was not sent", 0)
-		end
-
-		local Thread = coroutine.running()
-		Pending[CallId] = Thread
-		Write(CallId)
-		local Timeout = task.delay(Courier.Config.InvokeTimeout, Fail, Pending, CallId, Thread, "the call timed out")
-
-		return Settle(Timeout, coroutine.yield())
 	end)
+	Pending[CallId] = Settled
+	local Written, Problem = pcall(Write, CallId)
+	if not Written then
+		Pending[CallId] = nil
+		Settled(false, tostring(Problem))
+	end
+	return Job
 end
 
 function Courier.Complete(Peer: Player?, CallId: number, Success: boolean, ...: any)
@@ -421,14 +386,12 @@ function Courier.Complete(Peer: Player?, CallId: number, Success: boolean, ...: 
 	if Pending == nil then
 		return
 	end
-	local Thread = Pending[CallId]
-	if Thread == nil then
+	local Settled = Pending[CallId]
+	if Settled == nil then
 		return
 	end
 	Pending[CallId] = nil
-	if coroutine.status(Thread) == "suspended" then
-		task.spawn(Thread, Success, ...)
-	end
+	Settled(Success, ...)
 end
 
 function Courier.Bind(Schema: Schema)

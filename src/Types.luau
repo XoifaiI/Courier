@@ -33,7 +33,6 @@ type FutureImpl<T...> = {
 
 	Wait: (self: Future<T...>, Timeout: number?) -> T...,
 	Cancel: (self: Future<T...>) -> (),
-	Consume: (self: Future<T...>) -> (),
 
 	Data: (self: Future<T...>) -> T...,
 	Happened: (self: Future<T...>) -> boolean,

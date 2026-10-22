@@ -3,6 +3,10 @@
 local RunService = game:GetService("RunService")
 
 local Config = require("./Config")
+local Libraries = require("./Libraries")
+local Tests = require("./Tests")
+
+export type Library = Libraries.Library
 
 export type Table = {
 	Row: (...string) -> (),
@@ -28,38 +32,63 @@ end
 
 local Handlers: { [string]: (Player, ...any) -> ...any } = {}
 local Listeners: { [string]: (Player, ...any) -> () } = {}
-local Modes: { [string]: any } = {}
-local Tools: { string }? = nil
+
+local function Size(Value: any, Depth: number): number
+	local Kind = typeof(Value)
+	if Kind == "buffer" then
+		return buffer.len(Value)
+	elseif Kind == "string" then
+		return #Value
+	elseif Kind == "table" and Depth < 16 then
+		local Total = 0
+		for Key, Field in Value do
+			Total += Size(Key, Depth + 1) + Size(Field, Depth + 1)
+		end
+		return Total
+	elseif Kind == "Vector3" then
+		return 12
+	elseif Kind == "number" then
+		return 8
+	elseif Kind == "boolean" then
+		return 1
+	end
+	return 4
+end
 
 local Framework = {}
 
 Framework.Config = Config
 
-function Framework.Tools(): { string }
-	if Tools then
-		return Tools
-	end
-	local Chosen = Config.Tools
-	local Found: { string } = {}
-	if Chosen then
-		Found = table.clone(Chosen)
-	else
-		for _, Mode in (ROOT :: any).Shared.Modes:GetChildren() do
-			table.insert(Found, Mode.Name)
-		end
-		table.sort(Found)
-	end
-	Tools = Found
-	return Found
+function Framework.Libraries(): { string }
+	return Config.Libraries or Libraries.Available()
 end
 
-function Framework.Mode(Tool: string): any
-	local Mode = Modes[Tool]
-	if Mode == nil then
-		Mode = require((ROOT :: any).Shared.Modes[Tool]) :: any
-		Modes[Tool] = Mode
+function Framework.Library(Name: string): Library
+	return Libraries.Load(Name)
+end
+
+function Framework.Tests(): { string }
+	if Config.Tests then
+		return Config.Tests
 	end
-	return Mode
+	local Names: { string } = {}
+	for Name in Tests do
+		table.insert(Names, Name)
+	end
+	table.sort(Names)
+	return Names
+end
+
+function Framework.Pool(Test: string): { any }
+	return Tests[Test]
+end
+
+function Framework.Size(...: any): number
+	local Total = 0
+	for Index = 1, select("#", ...) do
+		Total += Size((select(Index, ...)), 0)
+	end
+	return Total
 end
 
 function Framework.Handle(Name: string, Handler: (Player, ...any) -> ...any)
@@ -142,10 +171,10 @@ function Framework.Table(Columns: { string }): Table
 end
 
 if IS_SERVER then
-	Handlers.Drain = function()
+	Handlers.Drain = function(): boolean
 		return true
 	end
-	Handlers.Print = function(_: Player, Title: string, Text: string)
+	Handlers.Print = function(_: Player, Title: string, Text: string): boolean
 		Framework.Print(Title, Text)
 		return true
 	end

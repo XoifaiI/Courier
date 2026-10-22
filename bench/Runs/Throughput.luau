@@ -1,20 +1,22 @@
 --!strict
 
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Stats = game:GetService("Stats")
 
-local Benches = require("../Shared/Benches") :: any
+local Framework = require("../Framework")
 
-local WINDOW = 0.5
+local WINDOW = 0.25
 local NORMAL_FRAMERATE = 60
 
 type Result = {
-	Skipped: boolean?,
 	Sent: number,
 	Framerate: { number },
 	Bandwidth: { number },
 	Heap: { number },
 }
+
+type Results = { [string]: { [string]: Result } }
 
 local function Same(A: any, B: any): boolean
 	if type(A) ~= "table" or type(B) ~= "table" then
@@ -33,88 +35,20 @@ local function Same(A: any, B: any): boolean
 	return true
 end
 
-local function Spread(Framework: any, Samples: { number }, Format: string): string
-	local Low = string.format(Format, Framework.Percentile(Samples, 10))
-	local High = string.format(Format, Framework.Percentile(Samples, 90))
-	return `{Low} to {High}`
-end
-
-local function Server(Framework: any)
-	local Received: { [string]: { [string]: number } } = {}
-	local ServerHeap: { [string]: number } = {}
-	local Running: string? = nil
-
-	for _, Tool in Framework.Tools() do
-		local Mode = Framework.Mode(Tool)
-		for Name, Data in Benches do
-			Received[Name] = Received[Name] or {}
-			local Counts = Received[Name]
-			Counts[Tool] = 0
-			Mode.On(Name, function(_: Player, Value: any)
-				Counts[Tool] += 1
-				if Counts[Tool] == 1 and not Same(Data, Value) then
-					warn(`Bench: {Tool} delivered wrong data for {Name}`)
-				end
-			end)
-		end
+local function Format(Samples: { number }, Spread: boolean): string
+	if Spread then
+		return `{string.format("%.0f", Framework.Percentile(Samples, 10))} to {string.format(
+			"%.0f",
+			Framework.Percentile(Samples, 90)
+		)}`
 	end
-
-	Framework.Listen("Running", function(_: Player, Key: string?)
-		Running = Key
-	end)
-
-	RunService.Heartbeat:Connect(function()
-		if Running then
-			ServerHeap[Running] = math.max(ServerHeap[Running] or 0, gcinfo() / 1024)
-		end
-	end)
-
-	Framework.Handle("Report", function(_: Player, Results: { [string]: { [string]: Result } })
-		local Out: { string } = {}
-		local Order: { string } = Framework.Tools()
-		for Name, Tools in Results do
-			local Ranked = table.clone(Order)
-			table.sort(Ranked, function(A: string, B: string): boolean
-				return Framework.Median(Tools[A].Framerate) > Framework.Median(Tools[B].Framerate)
-			end)
-			local Rows = Framework.Table({
-				Name,
-				"FPS",
-				"FPS P10 to P90",
-				"Kbps",
-				"Lost",
-				"Client heap MB",
-				"Server heap MB",
-				"Samples",
-			})
-			for _, Tool in Ranked do
-				local Result = Tools[Tool]
-				if Result.Skipped then
-					Rows.Row(Tool, "skipped", "", "", "", "", "", "")
-					continue
-				end
-				local Lost = (1 - Received[Name][Tool] / math.max(Result.Sent, 1)) * 100
-				Rows.Row(
-					Tool,
-					string.format("%.0f", Framework.Median(Result.Framerate)),
-					Spread(Framework, Result.Framerate, "%.0f"),
-					string.format("%.1f", Framework.Median(Result.Bandwidth)),
-					string.format("%.1f%%", Lost),
-					string.format("%.1f", Framework.Median(Result.Heap)),
-					string.format("%.1f", ServerHeap[`{Name}/{Tool}`] or 0),
-					tostring(#Result.Framerate)
-				)
-			end
-			table.insert(Out, (Rows.Text()))
-		end
-		Framework.Print("Throughput results", table.concat(Out, "\n\n"))
-		return true
-	end)
+	return string.format("%.0f", Framework.Median(Samples))
 end
 
-local function Measure(Framework: any, Mode: any, Name: string, Data: any, Result: Result)
-	local Fire = Mode.Fire[Name]
+local function Measure(Fire: (any) -> (), Pool: { any }, Result: Result)
 	local Fires = Framework.Config.FiresPerFrame
+	local Count = #Pool
+	local Next = 0
 	local Tick = Framework.Windows(WINDOW)
 	local Frames = 0
 	local Connection = RunService.PostSimulation:Connect(function(DeltaTime: number)
@@ -124,13 +58,14 @@ local function Measure(Framework: any, Mode: any, Name: string, Data: any, Resul
 			if Kept then
 				local Framerate = Frames / Window
 				table.insert(Result.Framerate, Framerate)
-				table.insert(Result.Bandwidth, Stats.DataSendKbps * (NORMAL_FRAMERATE / Framerate))
+				table.insert(Result.Bandwidth, Stats.DataSendKbps * NORMAL_FRAMERATE / Framerate)
 				table.insert(Result.Heap, gcinfo() / 1024)
 			end
 			Frames = 0
 		end
 		for _ = 1, Fires do
-			Fire(Data)
+			Next = Next % Count + 1
+			Fire(Pool[Next])
 		end
 		Result.Sent += Fires
 	end)
@@ -138,38 +73,147 @@ local function Measure(Framework: any, Mode: any, Name: string, Data: any, Resul
 	Connection:Disconnect()
 end
 
-local function Client(Framework: any)
-	local Camera = workspace.CurrentCamera
-	Camera.FieldOfView = 1
-	Camera.CFrame = CFrame.new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+local function Server()
+	local Bench = ReplicatedStorage:WaitForChild("Bench")
+	local Received: { [string]: number } = {}
+	local Counted: { [string]: number } = {}
+	local Bytes: { [string]: number } = {}
+	local ServerHeap: { [string]: number } = {}
+	local Wrong: { [string]: boolean } = {}
+	local Running: string? = nil
+	local First = false
 
-	local Results: { [string]: { [string]: Result } } = {}
-	for Name in Benches do
-		Results[Name] = {}
-		for _, Tool in Framework.Tools() do
-			local Skip = Framework.Mode(Tool).Skip
-			Results[Name][Tool] = {
-				Skipped = Skip ~= nil and Skip[Name] == true,
-				Sent = 0,
-				Framerate = {},
-				Bandwidth = {},
-				Heap = {},
-			}
+	for _, Name in Framework.Libraries() do
+		local Library = Framework.Library(Name)
+		for _, Test in Framework.Tests() do
+			if not table.find(Library.Tests, Test) then
+				continue
+			end
+			local Key = `{Test}/{Name}`
+			local Expected = Framework.Pool(Test)[1]
+			Received[Key] = 0
+			Counted[Key] = 0
+			Bytes[Key] = 0
+			Library.On(Test, function(_: Player, Value: any)
+				Received[Key] += 1
+				if Running ~= Key then
+					return
+				end
+				Counted[Key] += 1
+				if First then
+					First = false
+					if not Same(Expected, Value) then
+						Wrong[Key] = true
+					end
+				end
+			end)
+		end
+	end
+
+	local function Watch(Item: Instance)
+		if Item.Parent == Bench or not (Item:IsA("RemoteEvent") or Item:IsA("UnreliableRemoteEvent")) then
+			return
+		end
+		((Item :: any).OnServerEvent :: RBXScriptSignal):Connect(function(_: Player, ...: any)
+			local Key = Running
+			if Key and Bytes[Key] then
+				Bytes[Key] += Framework.Size(...)
+			end
+		end)
+	end
+	for _, Root in { ReplicatedStorage, workspace } :: { Instance } do
+		for _, Item in Root:GetDescendants() do
+			Watch(Item)
+		end
+		Root.DescendantAdded:Connect(Watch)
+	end
+
+	Framework.Listen("Running", function(_: Player, Key: string?)
+		Running = Key
+		First = Key ~= nil
+	end)
+
+	RunService.Heartbeat:Connect(function()
+		local Key = Running
+		if Key then
+			ServerHeap[Key] = math.max(ServerHeap[Key] or 0, gcinfo() / 1024)
+		end
+	end)
+
+	Framework.Handle("Report", function(_: Player, Results: Results): boolean
+		local Out: { string } = {}
+		for _, Test in Framework.Tests() do
+			local Rows = Framework.Table({
+				Test,
+				"FPS",
+				"FPS P10 to P90",
+				"Bytes per message",
+				"KB/s at 60 FPS",
+				"Lost",
+				"Client MB",
+				"Server MB",
+			})
+			local Ranked: { string } = {}
+			for Name in Results[Test] do
+				table.insert(Ranked, Name)
+			end
+			table.sort(Ranked, function(A: string, B: string): boolean
+				return Framework.Median(Results[Test][A].Framerate) > Framework.Median(Results[Test][B].Framerate)
+			end)
+			for _, Name in Ranked do
+				local Result = Results[Test][Name]
+				local Key = `{Test}/{Name}`
+				Rows.Row(
+					if Wrong[Key] then `{Name} (wrong data)` else Name,
+					Format(Result.Framerate, false),
+					Format(Result.Framerate, true),
+					string.format("%.0f", Bytes[Key] / math.max(Counted[Key], 1)),
+					string.format("%.0f", Framework.Median(Result.Bandwidth)),
+					string.format("%.1f%%", (1 - Received[Key] / math.max(Result.Sent, 1)) * 100),
+					string.format("%.0f", Framework.Median(Result.Heap)),
+					string.format("%.0f", ServerHeap[Key] or 0)
+				)
+			end
+			for _, Name in Framework.Libraries() do
+				if Results[Test][Name] == nil then
+					Rows.Row(Name, "unsupported", "", "", "", "", "", "")
+				end
+			end
+			table.insert(Out, Rows.Text())
+		end
+		Framework.Print("Throughput results", table.concat(Out, "\n\n"))
+		return true
+	end)
+end
+
+local function Client()
+	local Libraries: { [string]: Framework.Library } = {}
+	for _, Name in Framework.Libraries() do
+		Libraries[Name] = Framework.Library(Name)
+	end
+
+	local Results: Results = {}
+	for _, Test in Framework.Tests() do
+		Results[Test] = {}
+		for Name, Library in Libraries do
+			if table.find(Library.Tests, Test) then
+				Results[Test][Name] = { Sent = 0, Framerate = {}, Bandwidth = {}, Heap = {} }
+			end
 		end
 	end
 
 	for Round = 1, Framework.Config.Rounds do
-		for Name, Data in Benches do
-			for _, Tool in Framework.Shuffled(Framework.Tools(), Round * 1000 + #Name) do
-				local Result = Results[Name][Tool]
-				if Result.Skipped then
+		for _, Test in Framework.Tests() do
+			for _, Name in Framework.Shuffled(Framework.Libraries(), Round * 1000 + #Test) do
+				local Result = Results[Test][Name]
+				if Result == nil then
 					continue
 				end
-				print(`Bench: round {Round}, {Name} with {Tool}`)
-				Framework.Notify("Running", `{Name}/{Tool}`)
-				Measure(Framework, Framework.Mode(Tool), Name, Data, Result)
-				Framework.Notify("Running", nil)
+				print(`Bench: round {Round}, {Test} with {Name}`)
+				Framework.Notify("Running", `{Test}/{Name}`)
+				Measure(Libraries[Name].Fire[Test], Framework.Pool(Test), Result)
 				Framework.Drain()
+				Framework.Notify("Running", nil)
 			end
 		end
 	end

@@ -1,5 +1,5 @@
-option ClientOutput = "vendor/blinkblox/Client.luau"
-option ServerOutput = "vendor/blinkblox/Server.luau"
+option ClientOutput = "../vendor/blinkblox/Client.luau"
+option ServerOutput = "../vendor/blinkblox/Server.luau"
 option RemoteScope = "BLINKBLOX"
 
 option MaxPacketSize = 2097152
