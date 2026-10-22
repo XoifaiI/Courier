@@ -1,6 +1,7 @@
 --!strict
 
 local RunService = game:GetService("RunService")
+local SceneAnalysisService = game:GetService("SceneAnalysisService")
 
 local Config = require("./Config")
 local Libraries = require("./Libraries")
@@ -55,6 +56,22 @@ local function Size(Value: any, Depth: number): number
 	return 4
 end
 
+local function Leaves(Node: { [string]: any }, Out: { [string]: number }): { [string]: number }
+	local Children = Node.Children
+	if Children == nil then
+		Out[Node.Name] = Node.Size
+		return Out
+	end
+	for _, Child in Children do
+		Leaves(Child, Out)
+	end
+	return Out
+end
+
+local function Owns(Path: string, Prefix: string): boolean
+	return Path == Prefix or string.sub(Path, 1, #Prefix + 1) == `{Prefix}.`
+end
+
 local Framework = {}
 
 Framework.Config = Config
@@ -89,6 +106,23 @@ function Framework.Size(...: any): number
 		Total += Size((select(Index, ...)), 0)
 	end
 	return Total
+end
+
+function Framework.Memory(): { [string]: number }
+	local Scripts = Leaves(SceneAnalysisService:GetScriptMemoryAsync(), {})
+	local Out: { [string]: number } = {}
+	for _, Name in Framework.Libraries() do
+		local Total = 0
+		for _, Prefix in Libraries.Modules(Name) do
+			for Path, Bytes in Scripts do
+				if Owns(Path, Prefix) then
+					Total += Bytes
+				end
+			end
+		end
+		Out[Name] = Total
+	end
+	return Out
 end
 
 function Framework.Handle(Name: string, Handler: (Player, ...any) -> ...any)

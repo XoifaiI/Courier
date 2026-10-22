@@ -5,7 +5,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TESTS = { "Booleans", "Dict", "Entities", "Numbers", "Strings", "Vectors" }
 
 local Config = (require(ReplicatedStorage:WaitForChild("Courier")) :: any).Config
-Config.ReliableCapacity = 4194304
 Config.MaxFrameBytes = 16777216
 
 local Net = require("../Vendor/net") :: any

@@ -9,7 +9,8 @@ local Framework = require("../Framework")
 local COPIES = 64
 local WARM = 200
 local BATCH_SECONDS = 0.01
-local BATCHES = 5
+local BATCHES = 3
+local ROUNDS = 5
 
 local function Fastest(Step: () -> ()): number
 	for _ = 1, WARM do
@@ -82,9 +83,26 @@ local function Server()
 	end)
 	local Rows = Framework.Table({ "Test", "Codec", "Encode µs", "Decode µs" })
 	for _, Test in Framework.Tests() do
+		local Encodes: { [string]: { number } } = {}
+		local Decodes: { [string]: { number } } = {}
 		for _, Variant in Variants do
-			local Encode, Decode = Measure(Variant.Codec, Test, Framework.Pool(Test))
-			Rows.Row(Test, Variant.Name, string.format("%.2f", Encode * 1e6), string.format("%.2f", Decode * 1e6))
+			Encodes[Variant.Name] = {}
+			Decodes[Variant.Name] = {}
+		end
+		for Round = 1, ROUNDS do
+			for _, Variant in Framework.Shuffled(Variants, Round) do
+				local Encode, Decode = Measure(Variant.Codec, Test, Framework.Pool(Test))
+				table.insert(Encodes[Variant.Name], Encode * 1e6)
+				table.insert(Decodes[Variant.Name], Decode * 1e6)
+			end
+		end
+		for _, Variant in Variants do
+			Rows.Row(
+				Test,
+				Variant.Name,
+				string.format("%.2f", Framework.Median(Encodes[Variant.Name])),
+				string.format("%.2f", Framework.Median(Decodes[Variant.Name]))
+			)
 		end
 	end
 	Framework.Print("Cpu results, per message", Rows.Text())

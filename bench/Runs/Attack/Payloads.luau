@@ -2,7 +2,19 @@
 
 export type Payload = { n: number, [number]: any }
 
-local CATEGORIES = { "Junk", "Buffers", "Truncated", "Flipped", "Overwritten", "Tables", "Arguments" }
+local CATEGORIES = {
+	"Junk",
+	"Buffers",
+	"Truncated",
+	"Flipped",
+	"Overwritten",
+	"Tables",
+	"Sparse",
+	"Arguments",
+	"NilArguments",
+	"ManyArguments",
+	"JSON",
+}
 
 local Rng = Random.new(1)
 
@@ -93,6 +105,22 @@ local function Mutated(Value: any): any
 	return Copy
 end
 
+local GAPS = { 1000, 65536, 1000000, 2 ^ 31 - 1 }
+
+local function Sparse(Original: { any }): { { any } }
+	local First = Original[1]
+	local Out = {}
+	for _, Gap in GAPS do
+		table.insert(Out, { [1] = First, [Gap] = {} })
+		local Padded = table.clone(Original)
+		Padded[#Original + Gap] = {}
+		table.insert(Out, Padded)
+	end
+	table.insert(Out, { [0] = First, [-1] = {} })
+	table.insert(Out, { [1] = First, [3] = First })
+	return Out
+end
+
 local function EachBuffer(Samples: { Payload }, Make: (buffer) -> { buffer }): { Payload }
 	local Out = {}
 	for _, Sample in Samples do
@@ -104,6 +132,21 @@ local function EachBuffer(Samples: { Payload }, Make: (buffer) -> { buffer }): {
 					Copy[Index] = Replacement
 					table.insert(Out, Copy)
 				end
+			end
+		end
+	end
+	return Out
+end
+
+local function EachValue(Samples: { Payload }, Values: { any }): { Payload }
+	local Out: { Payload } = {}
+	for _, Value in Values do
+		table.insert(Out, Pack(Value))
+		for _, Sample in Samples do
+			for Index = 1, Sample.n do
+				local Copy = table.clone(Sample) :: Payload
+				Copy[Index] = Value
+				table.insert(Out, Copy)
 			end
 		end
 	end
@@ -217,7 +260,7 @@ local BUILD: { [string]: (Samples: { Payload }) -> { Payload } } = {
 	Tables = function(Samples)
 		local Out = {
 			Pack(Nested(100)),
-			Pack(Nested(1000)),
+			Pack(Nested(290)),
 			Pack(table.create(50000, 0)),
 			Pack({ [1] = 1, [1000000] = 1 }),
 			Pack({ 1, 2, a = 3 }),
@@ -238,6 +281,32 @@ local BUILD: { [string]: (Samples: { Payload }) -> { Payload } } = {
 						Copy[Index] = Mutated(Sample[Index])
 						table.insert(Out, Copy)
 					end
+				end
+			end
+		end
+		return Out
+	end,
+	Sparse = function(Samples)
+		local Out = {}
+		for _, Sample in Samples do
+			local Found = false
+			for Index = 1, Sample.n do
+				local Arg = Sample[Index]
+				if type(Arg) == "table" then
+					Found = true
+					for _, Replacement in Sparse(Arg) do
+						local Copy = table.clone(Sample) :: Payload
+						Copy[Index] = Replacement
+						table.insert(Out, Copy)
+					end
+				end
+			end
+			if not Found then
+				for _, Extra in Sparse({ workspace }) do
+					local Copy = table.clone(Sample) :: Payload
+					Copy.n += 1
+					Copy[Copy.n] = Extra
+					table.insert(Out, Copy)
 				end
 			end
 		end
@@ -264,6 +333,113 @@ local BUILD: { [string]: (Samples: { Payload }) -> { Payload } } = {
 			end
 		end
 		return Out
+	end,
+	NilArguments = function(Samples)
+		local Out: { Payload } = {
+			Pack(nil),
+			Pack(nil, nil),
+			Pack(nil, nil, nil),
+			Pack("number", nil, "string"),
+			Pack("number", nil, "string", nil),
+			Pack("number", nil, "string", nil, nil),
+			Pack(nil, "string", nil),
+		}
+		for _, Sample in Samples do
+			for _, Extra in { 1, 2, 8, 32 } do
+				local Copy = table.clone(Sample) :: Payload
+				Copy.n = Sample.n + Extra
+				table.insert(Out, Copy)
+			end
+			for Position = 1, Sample.n + 1 do
+				local Copy: Payload = { n = Sample.n + 1 }
+				for Index = 1, Sample.n do
+					local Destination = if Index < Position then Index else Index + 1
+					Copy[Destination] = Sample[Index]
+				end
+				table.insert(Out, Copy)
+			end
+			for Index = 1, Sample.n do
+				local Copy = table.clone(Sample) :: Payload
+				Copy[Index] = nil
+				table.insert(Out, Copy)
+			end
+			for Keep = 0, Sample.n do
+				local Copy: Payload = { n = Sample.n }
+				for Index = 1, Keep do
+					Copy[Index] = Sample[Index]
+				end
+				table.insert(Out, Copy)
+			end
+		end
+		return Out
+	end,
+	ManyArguments = function(Samples)
+		local Out: { Payload } = {}
+		for _, Count in { 7999, 8000, 8001 } do
+			local Dense = table.create(Count, 0) :: any
+			Dense.n = Count
+			table.insert(Out, Dense :: Payload)
+			local AllNil: Payload = { n = Count }
+			table.insert(Out, AllNil)
+			local Holes: Payload = { n = Count }
+			Holes[1] = "first"
+			Holes[Count - 1] = "last non-nil"
+			table.insert(Out, Holes)
+			for _, Sample in Samples do
+				if Sample.n <= Count then
+					local Extra = table.clone(Sample) :: Payload
+					for Index = Sample.n + 1, Count do
+						Extra[Index] = 0
+					end
+					Extra.n = Count
+					table.insert(Out, Extra)
+					local Trailing = table.clone(Sample) :: Payload
+					Trailing.n = Count
+					table.insert(Out, Trailing)
+				end
+			end
+		end
+		return Out
+	end,
+	JSON = function(Samples)
+		return EachValue(Samples, {
+			0 / 0,
+			math.huge,
+			-math.huge,
+			{ value = 0 / 0 },
+			{ value = math.huge },
+			{ value = -math.huge },
+			{ [1] = "array", label = "object" },
+			{ [1] = "numeric", ["1"] = "string" },
+			{ [1] = "first", [3] = "third" },
+			{ [0] = "zero", [-1] = "negative", [1] = "one" },
+			{ n = 3, [1] = "number", [3] = "string" },
+			{ n = 5, [1] = "number", [3] = "string" },
+			{ n = 32 },
+			"\0",
+			'"\\\n\r\t',
+			"\255",
+			"\192\175",
+			"\237\160\128",
+			{ value = "\255" },
+			{ ["\255"] = "invalid UTF-8 key" },
+			{ value = workspace },
+			{ value = Vector3.new(1, 2, 3) },
+			{ value = CFrame.new() },
+			{ value = buffer.create(8) },
+			"null",
+			"[]",
+			"{}",
+			"[1,null,3,null]",
+			'{"n":5,"1":"number","3":"string"}',
+			'{"value":1,"value":2}',
+			'{"value":1e309}',
+			'{"value":NaN}',
+			'{"value":Infinity}',
+			'{"value":"\\uD800"}',
+			'{"value":',
+			"[1,]",
+		})
 	end,
 }
 

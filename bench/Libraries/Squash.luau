@@ -79,8 +79,10 @@ return {
 	Tests = TESTS,
 	Fire = Fire,
 	On = function(Test: string, Handler: (Player, any) -> ())
-		Remotes[Test].OnServerEvent:Connect(function(Player: Player, Data: buffer)
-			Handler(Player, Read(Test, Data))
+		Remotes[Test].OnServerEvent:Connect(function(Player: Player, Data: unknown)
+			if typeof(Data) == "buffer" then
+				Handler(Player, Read(Test, Data))
+			end
 		end)
 	end,
 	Game = {
@@ -94,8 +96,10 @@ return {
 			Remotes.Input:FireServer(Write("Input", Value))
 		end,
 		OnInput = function(Handler: (Player, any) -> ())
-			Remotes.Input.OnServerEvent:Connect(function(Player: Player, Data: buffer)
-				Handler(Player, Read("Input", Data))
+			Remotes.Input.OnServerEvent:Connect(function(Player: Player, Data: unknown)
+				if typeof(Data) == "buffer" then
+					Handler(Player, Read("Input", Data))
+				end
 			end)
 		end,
 	},

@@ -13,7 +13,7 @@ type Result = {
 	Sent: number,
 	Framerate: { number },
 	Bandwidth: { number },
-	Heap: { number },
+	Allocated: { number },
 }
 
 type Results = { [string]: { [string]: Result } }
@@ -59,13 +59,17 @@ local function Measure(Fire: (any) -> (), Pool: { any }, Result: Result)
 				local Framerate = Frames / Window
 				table.insert(Result.Framerate, Framerate)
 				table.insert(Result.Bandwidth, Stats.DataSendKbps * NORMAL_FRAMERATE / Framerate)
-				table.insert(Result.Heap, gcinfo() / 1024)
 			end
 			Frames = 0
 		end
+		local Before = gcinfo()
 		for _ = 1, Fires do
 			Next = Next % Count + 1
 			Fire(Pool[Next])
+		end
+		local After = gcinfo()
+		if After >= Before then
+			table.insert(Result.Allocated, (After - Before) * 1024 / Fires)
 		end
 		Result.Sent += Fires
 	end)
@@ -78,7 +82,8 @@ local function Server()
 	local Received: { [string]: number } = {}
 	local Counted: { [string]: number } = {}
 	local Bytes: { [string]: number } = {}
-	local ServerHeap: { [string]: number } = {}
+	local Rise: { [string]: number } = {}
+	local CellStart, CellPeak = 0, 0
 	local Wrong: { [string]: boolean } = {}
 	local Running: string? = nil
 	local First = false
@@ -129,19 +134,37 @@ local function Server()
 	end
 
 	Framework.Listen("Running", function(_: Player, Key: string?)
+		local Previous = Running
+		if Previous then
+			Rise[Previous] = math.max(Rise[Previous] or 0, CellPeak - CellStart)
+		end
 		Running = Key
 		First = Key ~= nil
+		CellStart = gcinfo()
+		CellPeak = CellStart
 	end)
 
 	RunService.Heartbeat:Connect(function()
-		local Key = Running
-		if Key then
-			ServerHeap[Key] = math.max(ServerHeap[Key] or 0, gcinfo() / 1024)
+		if Running then
+			CellPeak = math.max(CellPeak, gcinfo())
 		end
 	end)
 
-	Framework.Handle("Report", function(_: Player, Results: Results): boolean
+	Framework.Handle("Report", function(_: Player, Results: Results, ClientMemory: { [string]: number }): boolean
 		local Out: { string } = {}
+		local ServerMemory = Framework.Memory()
+		local Held: { string } = Framework.Libraries()
+		table.sort(Held, function(A: string, B: string): boolean
+			return ServerMemory[A] + ClientMemory[A] < ServerMemory[B] + ClientMemory[B]
+		end)
+		local Memory = Framework.Table({ "Memory held after the run", "Server KB", "Client KB" })
+		for _, Name in Held do
+			Memory.Row(
+				Name,
+				string.format("%.0f", ServerMemory[Name] / 1024),
+				string.format("%.0f", ClientMemory[Name] / 1024)
+			)
+		end
 		for _, Test in Framework.Tests() do
 			local Rows = Framework.Table({
 				Test,
@@ -150,8 +173,8 @@ local function Server()
 				"Bytes per message",
 				"KB/s at 60 FPS",
 				"Lost",
-				"Client MB",
-				"Server MB",
+				"Client bytes allocated per message",
+				"Server heap rise MB",
 			})
 			local Ranked: { string } = {}
 			for Name in Results[Test] do
@@ -170,8 +193,8 @@ local function Server()
 					string.format("%.0f", Bytes[Key] / math.max(Counted[Key], 1)),
 					string.format("%.0f", Framework.Median(Result.Bandwidth)),
 					string.format("%.1f%%", (1 - Received[Key] / math.max(Result.Sent, 1)) * 100),
-					string.format("%.0f", Framework.Median(Result.Heap)),
-					string.format("%.0f", ServerHeap[Key] or 0)
+					string.format("%.0f", Framework.Median(Result.Allocated)),
+					string.format("%.1f", (Rise[Key] or 0) / 1024)
 				)
 			end
 			for _, Name in Framework.Libraries() do
@@ -181,6 +204,7 @@ local function Server()
 			end
 			table.insert(Out, Rows.Text())
 		end
+		table.insert(Out, Memory.Text())
 		Framework.Print("Throughput results", table.concat(Out, "\n\n"))
 		return true
 	end)
@@ -197,7 +221,7 @@ local function Client()
 		Results[Test] = {}
 		for Name, Library in Libraries do
 			if table.find(Library.Tests, Test) then
-				Results[Test][Name] = { Sent = 0, Framerate = {}, Bandwidth = {}, Heap = {} }
+				Results[Test][Name] = { Sent = 0, Framerate = {}, Bandwidth = {}, Allocated = {} }
 			end
 		end
 	end
@@ -217,7 +241,7 @@ local function Client()
 			end
 		end
 	end
-	Framework.Call("Report", Results)
+	Framework.Call("Report", Results, Framework.Memory())
 end
 
 return { Server = Server, Client = Client }

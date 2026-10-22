@@ -88,30 +88,76 @@ Run in Studio with the [bench](bench), which you can run yourself. All 16 librar
 
 **Game**, a server sending 50 moving things and a few events to a player every frame.
 
-| | Bytes per frame | Server time per frame |
-|---|---|---|
-| **Courier** | **863** | **10 µs** |
-| BlinkBlox | 865 | 17 µs |
-| Blink | 865 | 29 µs |
-| QuickNetRaised | 868 | 24 µs |
-| BitNet | 873 | 25 µs |
+| | Bytes per frame | Remote calls per frame | Server time per frame |
+|---|---|---|---|
+| **Courier** | 863 | 1.00 | **53 µs** |
+| BlinkBlox | 865 | 1.00 | 54 µs |
+| QuickNet | 868 | 0.99 | 56 µs |
+| Satset | 869 | 0.99 | 68 µs |
+| Blink | 865 | 1.00 | 72 µs |
+| ByteNet | 870 | 1.00 | 74 µs |
+| NetRayCompile | 865 | 3.06 | 77 µs |
+| Zap | 865 | 1.00 | 81 µs |
+| BitNet | 874 | 1.01 | 82 µs |
+| Packet | 866 | 1.00 | 98 µs |
+| Lync | 867 | 1.00 | 109 µs |
+| Squash | 862 | 3.06 | 114 µs |
+| PakNet | 874 | 3.06 | 136 µs |
+| Roblox remotes | 3240 | 3.06 | 162 µs |
 
-Courier writes each message when you fire it, so its 10 µs is all of its work. Some of the others
-finish theirs later in the frame.
+No library lost a message or handed the game a bad value. Courier writes each message when you fire
+it, so its 53 µs is all of its work. Some of the others finish theirs later in the frame. BitNet
+sent about a quarter as many messages as the others in the same time.
 
-**Attack**, Random exploit gibberish sent
+**Attack**, a client sending everything an exploiter could: junk values, random, cut and flipped
+buffers, deep and sparse tables, missing and extra arguments, 8000 arguments, and broken JSON.
 
-| | Server errors | Warnings | Bad values handed to the game | Longest frame |
-|---|---|---|---|---|
-| **Courier** | **0** | **0** | **0** | 27 ms |
-| BlinkBlox | 0 | 3 | 6 | 26 ms |
-| QuickNetRaised | 0 | 179 | 9 | 32 ms |
-| Blink | 156 | 0 | 6 | 47 ms |
-| BitNet | 0 | 233 | 0 | 213 ms |
+| | Server errors | Warnings | Bad values handed to the game | Longest frame | Memory peak |
+|---|---|---|---|---|---|
+| **Courier** | **0** | **0** | **0** | 317 ms | +60 KB |
+| Satset | 0 | 0 | 0 | 311 ms | +3 KB |
+| BitNet | 0 | 894 | 0 | 310 ms | 0 KB |
+| Packet | 0 | 317 | 1 | 295 ms | +82 KB |
+| BlinkBlox | 0 | 6 | 2 | 317 ms | +143 KB |
+| Lync | 0 | 90 | 2 | 315 ms | +4 KB |
+| QuickNet | 0 | 504 | 6 | 548 ms | 0 KB |
+| ByteNet | 90 | 0 | 1 | 323 ms | 0 KB |
+| NetRayCompile | 165 | 0 | 4 | 310 ms | 0 KB |
+| Squash | 187 | 0 | 8 | 565 ms | +851 MB |
+| Zap | 420 | 0 | 3 | 326 ms | +3 KB |
+| Blink | 469 | 1 | 2 | 311 ms | +201 KB |
+| PakNet | 916 | 0 | 2 | 316 ms | +364 KB |
+| Roblox remotes | 0 | 0 | 919 | 301 ms | 0 KB |
 
-Bad values include NaN vectors and broken tables that reached a handler. Bandwidth in the throughput
-test isn't shown: every message is the same, so Roblox compresses them all to about one. The
-[bench](bench) explains the rest.
+Bad values include NaN vectors and broken tables that reached a handler. Memory
+peak is the most the library's own scripts held over what they held before. Squash reads an array
+length from the packet and allocates it before checking the bytes are there, so 826 KB of junk
+buffers made it hold 851 MB.
+
+<details>
+<summary>Server errors / bad values by attack</summary>
+
+| | Junk | Buffers | Truncated | Flipped | Overwritten | Tables | Sparse | Arguments | Nil arguments | 8000 arguments | JSON |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **Courier** | - | - | - | - | - | - | - | - | - | - | - |
+| Satset | - | - | - | - | - | - | - | - | - | - | - |
+| BitNet | - | - | - | - | - | - | - | - | - | - | - |
+| Packet | - | - | - | - | 0 / 1 | - | - | - | - | - | - |
+| BlinkBlox | - | - | - | - | 0 / 2 | - | - | - | - | - | - |
+| Lync | - | - | - | - | 0 / 2 | - | - | - | - | - | - |
+| QuickNet | - | - | - | 0 / 1 | 0 / 5 | - | - | - | - | - | - |
+| ByteNet | - | 34 / 0 | 28 / 0 | 1 / 0 | 16 / 1 | - | - | 11 / 0 | - | - | - |
+| NetRayCompile | 20 / 0 | 22 / 0 | 42 / 0 | 10 / 0 | 3 / 4 | 9 / 0 | - | 7 / 0 | 7 / 0 | 9 / 0 | 36 / 0 |
+| Squash | - | 91 / 0 | 29 / 4 | 7 / 0 | 28 / 4 | - | - | 32 / 0 | - | - | - |
+| Zap | 20 / 0 | 19 / 0 | 42 / 0 | 11 / 0 | 30 / 3 | 9 / 0 | - | 12 / 0 | 25 / 0 | - | 252 / 0 |
+| Blink | 39 / 0 | 9 / 0 | 42 / 0 | 16 / 0 | 17 / 2 | 15 / 0 | - | 11 / 0 | 32 / 0 | - | 288 / 0 |
+| PakNet | 120 / 0 | 120 / 0 | 48 / 0 | 12 / 0 | 28 / 2 | 54 / 0 | - | 42 / 0 | 60 / 0 | - | 432 / 0 |
+| Roblox remotes | 0 / 120 | 0 / 120 | - | - | - | 0 / 145 | 0 / 14 | 0 / 42 | 0 / 60 | - | 0 / 418 |
+
+</details>
+
+Bandwidth in the throughput test isn't shown: every message is the same, so Roblox compresses them
+all to about one. The [bench](bench) explains the rest.
 
 ## Installing
 

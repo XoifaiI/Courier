@@ -13,7 +13,7 @@ type Payload = Payloads.Payload
 local SAMPLES_PER_REMOTE = 6
 local FIRES_PER_FRAME = 25
 
-type Category = { Base: number, Peak: number, Sent: number }
+type Category = { Base: number, Peak: number, Sent: number, Errors: number, Invalid: number }
 
 type Report = {
 	Categories: { [string]: Category },
@@ -26,9 +26,9 @@ type Report = {
 	Live: number,
 	Expected: number,
 	LongestFrame: number,
-	HeapBefore: number,
-	HeapPeak: number,
-	HeapAfter: number,
+	HeldBefore: number,
+	HeldPeak: number,
+	HeldAfter: number,
 }
 
 local function Remotes(): { [Instance]: boolean }
@@ -99,6 +99,9 @@ local function Server()
 					Report.Delivered += 1
 					if not Validate(Name, Value) then
 						Report.Invalid += 1
+						if Current.Category then
+							Current.Category.Invalid += 1
+						end
 						if Report.FirstInvalid == nil then
 							Report.FirstInvalid = `{Name}: {Describe(Value)}`
 						end
@@ -124,9 +127,9 @@ local function Server()
 			Live = 0,
 			Expected = Expected,
 			LongestFrame = 0,
-			HeapBefore = 0,
-			HeapPeak = 0,
-			HeapAfter = 0,
+			HeldBefore = 0,
+			HeldPeak = 0,
+			HeldAfter = 0,
 		}
 	end
 	if Owned.Courier then
@@ -161,6 +164,9 @@ local function Server()
 		end
 		if Kind == Enum.MessageType.MessageError then
 			Report.Errors += 1
+			if Current.Category then
+				Current.Category.Errors += 1
+			end
 			if Report.FirstError == nil then
 				Report.FirstError = string.sub(Message, 1, 120)
 			end
@@ -174,12 +180,10 @@ local function Server()
 		if Report == nil or Current.Phase ~= "Attack" then
 			return
 		end
-		local Heap = gcinfo()
 		Report.LongestFrame = math.max(Report.LongestFrame, DeltaTime)
-		Report.HeapPeak = math.max(Report.HeapPeak, Heap)
 		local Category = Current.Category
 		if Category then
-			Category.Peak = math.max(Category.Peak, Heap)
+			Category.Peak = math.max(Category.Peak, gcinfo())
 		end
 	end)
 
@@ -187,10 +191,10 @@ local function Server()
 		Current.Category = nil
 		local Report = Reports[Tool]
 		if Phase == "Attack" then
-			Report.HeapBefore = gcinfo()
-			Report.HeapPeak = Report.HeapBefore
+			Report.HeldBefore = Framework.Memory()[Tool]
+			Report.HeldPeak = Report.HeldBefore
 		elseif Phase == "Done" then
-			Report.HeapAfter = gcinfo()
+			Report.HeldAfter = Framework.Memory()[Tool]
 		end
 		Current.Phase = Phase
 		Current.Tool = Tool
@@ -199,7 +203,7 @@ local function Server()
 
 	Framework.Handle("Category", function(_: Player, Name: string)
 		local Heap = gcinfo()
-		local Category = { Base = Heap, Peak = Heap, Sent = 0 }
+		local Category = { Base = Heap, Peak = Heap, Sent = 0, Errors = 0, Invalid = 0 }
 		Reports[Current.Tool].Categories[Name] = Category
 		Current.Category = Category
 		return true
@@ -210,6 +214,8 @@ local function Server()
 		if Category then
 			Category.Sent += Bytes
 		end
+		local Report = Reports[Current.Tool]
+		Report.HeldPeak = math.max(Report.HeldPeak, Framework.Memory()[Current.Tool])
 		return true
 	end)
 
@@ -235,9 +241,10 @@ local function Server()
 			"Values handed to the game",
 			"Works after",
 			"Longest frame (ms)",
-			"Heap growth (MB)",
-			"Heap peak over start (MB)",
-			"Worst allocation",
+			"Library memory before (KB)",
+			"Library memory peak (KB)",
+			"Library memory after (KB)",
+			"Worst heap spike",
 		})
 		local Examples: { string } = {}
 		for _, Tool in Framework.Libraries() do
@@ -250,8 +257,9 @@ local function Server()
 				tostring(Report.Delivered),
 				if Report.Live >= Report.Expected then "yes" else `no ({Report.Live}/{Report.Expected})`,
 				string.format("%.0f", Report.LongestFrame * 1000),
-				string.format("%.1f", (Report.HeapAfter - Report.HeapBefore) / 1024),
-				string.format("%.1f", (Report.HeapPeak - Report.HeapBefore) / 1024),
+				string.format("%.0f", Report.HeldBefore / 1024),
+				string.format("%.0f", Report.HeldPeak / 1024),
+				string.format("%.0f", Report.HeldAfter / 1024),
 				Worst(Report)
 			)
 			if Report.FirstError then
@@ -261,7 +269,21 @@ local function Server()
 				table.insert(Examples, `- {Tool} handed the game: {Report.FirstInvalid}`)
 			end
 		end
-		Framework.Print("Attack results", `{Results.Text()}\n\n{table.concat(Examples, "\n")}`)
+		local Columns = { "Errors / bad values by attack" }
+		for _, Name in Payloads.CATEGORIES do
+			table.insert(Columns, Name)
+		end
+		local ByAttack = Framework.Table(Columns)
+		for _, Tool in Framework.Libraries() do
+			local Cells = { Tool }
+			for _, Name in Payloads.CATEGORIES do
+				local Category = Reports[Tool].Categories[Name]
+				local Clean = Category == nil or (Category.Errors == 0 and Category.Invalid == 0)
+				table.insert(Cells, if Clean then "-" else `{Category.Errors} / {Category.Invalid}`)
+			end
+			ByAttack.Row(table.unpack(Cells))
+		end
+		Framework.Print("Attack results", `{Results.Text()}\n\n{ByAttack.Text()}\n\n{table.concat(Examples, "\n")}`)
 		return true
 	end)
 end
@@ -274,11 +296,43 @@ local function Client()
 	end
 
 	local function Fire(Remote: Instance, Payload: Payload)
-		local Target = Remote :: any
+		local function Send()
+			local Target = Remote :: any
+			local Ok, Error = pcall(function()
+				if Payload.n > 7997 then
+					if Remote:IsA("RemoteFunction") then
+						return Target:InvokeServer(
+							Payload[1],
+							Payload[2],
+							Payload[3],
+							Payload[4],
+							table.unpack(Payload, 5, Payload.n)
+						)
+					else
+						Target:FireServer(
+							Payload[1],
+							Payload[2],
+							Payload[3],
+							Payload[4],
+							table.unpack(Payload, 5, Payload.n)
+						)
+					end
+				else
+					if Remote:IsA("RemoteFunction") then
+						return Target:InvokeServer(table.unpack(Payload, 1, Payload.n))
+					else
+						Target:FireServer(table.unpack(Payload, 1, Payload.n))
+					end
+				end
+			end)
+			if not Ok then
+				warn(`Bench client rejection: {Remote:GetFullName()} n={Payload.n}: {Error}`)
+			end
+		end
 		if Remote:IsA("RemoteFunction") then
-			task.spawn(pcall, Target.InvokeServer, Target, table.unpack(Payload, 1, Payload.n))
+			task.spawn(Send)
 		else
-			pcall(Target.FireServer, Target, table.unpack(Payload, 1, Payload.n))
+			Send()
 		end
 	end
 

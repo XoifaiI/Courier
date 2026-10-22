@@ -14,7 +14,7 @@ export type Library = {
 	Game: Game,
 }
 
-type Entry = { Vendor: string?, Load: () -> Library }
+type Entry = { Vendor: string?, Runtime: string?, Load: () -> Library }
 
 local VENDOR = (script.Parent :: Instance):WaitForChild("Vendor")
 
@@ -45,6 +45,7 @@ local ENTRIES: { [string]: Entry } = {
 	},
 	Courier = {
 		Vendor = "net",
+		Runtime = "ReplicatedStorage.Courier",
 		Load = function(): Library
 			return require("@self/Courier")
 		end,
@@ -131,7 +132,20 @@ local function Load(Name: string): Library
 	return Library
 end
 
+local function Modules(Name: string): { string }
+	local Entry = ENTRIES[Name]
+	local Out = { `ReplicatedStorage.Bench.Libraries.{Name}` }
+	if Entry.Vendor then
+		table.insert(Out, `ReplicatedStorage.Bench.Vendor.{Entry.Vendor}`)
+	end
+	if Entry.Runtime then
+		table.insert(Out, Entry.Runtime)
+	end
+	return Out
+end
+
 return {
 	Available = Available,
 	Load = Load,
+	Modules = Modules,
 }
