@@ -1,8 +1,7 @@
 # Tools for this project, managed by Rokit (https://github.com/rojo-rbx/rokit).
 
 [tools]
-rojo = "rojo-rbx/rojo@7.7.0"
+rojo = "rojo-rbx/rojo@7.7.1"
 stylua = "JohnnyMorganz/StyLua@2.5.2"
 selene = "Kampfkarren/selene@0.31.0"
-luau-lsp = "JohnnyMorganz/luau-lsp@1.69.0"
-lune = "lune-org/lune@0.10.5"
+luau-lsp = "JohnnyMorganz/luau-lsp@1.70.0"
