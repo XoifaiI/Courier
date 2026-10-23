@@ -19,14 +19,4 @@ return {
 	On = function(Test: string, Handler: (Player, any) -> ())
 		Net[Test].On(Handler)
 	end,
-	Game = {
-		Send = { State = Net.State.Fire, Hit = Net.Hit.Fire, Pickup = Net.Pickup.Fire, Chat = Net.Chat.Fire },
-		On = function(Name: string, Handler: (any) -> ())
-			Net[Name].On(Handler)
-		end,
-		Input = Net.Input.Fire,
-		OnInput = function(Handler: (Player, any) -> ())
-			Net.Input.On(Handler)
-		end,
-	},
 }

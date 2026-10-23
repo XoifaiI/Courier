@@ -5,9 +5,6 @@ local RunService = game:GetService("RunService")
 
 local TESTS = { "Booleans", "Entities", "Strings", "Numbers", "Dict", "Vectors" }
 
-local NAMES =
-	{ "Booleans", "Entities", "Strings", "Numbers", "Dict", "Vectors", "State", "Hit", "Pickup", "Chat", "Input" }
-
 local function Remote(Name: string): RemoteEvent
 	if RunService:IsServer() then
 		local Event = Instance.new("RemoteEvent")
@@ -19,7 +16,7 @@ local function Remote(Name: string): RemoteEvent
 end
 
 local Remotes: { [string]: RemoteEvent } = {}
-for _, Name in NAMES do
+for _, Name in TESTS do
 	Remotes[Name] = Remote(Name)
 end
 
@@ -31,30 +28,10 @@ for _, Test in TESTS do
 	end
 end
 
-local Send: { [string]: (Player, any) -> () } = {}
-for _, Name in { "State", "Hit", "Pickup", "Chat" } do
-	local Target = Remotes[Name]
-	Send[Name] = function(Player: Player, Value: any)
-		Target:FireClient(Player, Value)
-	end
-end
-
 return {
 	Tests = TESTS,
 	Fire = Fire,
 	On = function(Test: string, Handler: (Player, any) -> ())
 		Remotes[Test].OnServerEvent:Connect(Handler)
 	end,
-	Game = {
-		Send = Send,
-		On = function(Name: string, Handler: (any) -> ())
-			Remotes[Name].OnClientEvent:Connect(Handler)
-		end,
-		Input = function(Value: any)
-			Remotes.Input:FireServer(Value)
-		end,
-		OnInput = function(Handler: (Player, any) -> ())
-			Remotes.Input.OnServerEvent:Connect(Handler)
-		end,
-	},
 }

@@ -7,7 +7,6 @@ local Lync = require("../Vendor/lync") :: any
 local TESTS = { "Booleans", "Entities", "Strings", "Numbers", "Dict", "Vectors" }
 
 local Byte = Lync.int(0, 255)
-local Short = Lync.int(0, 65535)
 
 local Net = Lync.define("bench", {
 	Booleans = Lync.packet(Lync.array(Lync.bool(), 0, 1000)),
@@ -24,22 +23,6 @@ local Net = Lync.define("bench", {
 	Vectors = Lync.packet(Lync.array(Lync.vec3(), 0, 500)),
 })
 
-local GameNet = Lync.define("game", {
-	State = Lync.packet(
-		Lync.array(Lync.struct({ id = Short, position = Lync.vec3(), yaw = Short, health = Byte }), 0, 64)
-	),
-	Hit = Lync.packet(Lync.struct({ attacker = Short, target = Short, damage = Byte })),
-	Pickup = Lync.packet(Lync.struct({ item = Short, slot = Byte })),
-	Chat = Lync.packet(Lync.str(0, 200)),
-	Input = Lync.packet(Lync.struct({
-		move = Lync.vec3(),
-		look = Lync.vec3(),
-		jump = Lync.bool(),
-		fire = Lync.bool(),
-		crouch = Lync.bool(),
-	})),
-})
-
 Lync.start()
 RunService.PostSimulation:Connect(function()
 	Lync.flush()
@@ -53,14 +36,6 @@ for _, Test in TESTS do
 	end
 end
 
-local Send: { [string]: (Player, any) -> () } = {}
-for _, Name in { "State", "Hit", "Pickup", "Chat" } do
-	local Target = GameNet[Name]
-	Send[Name] = function(Player: Player, Value: any)
-		Target:fireClient(Player, Value)
-	end
-end
-
 return {
 	Tests = TESTS,
 	Fire = Fire,
@@ -69,18 +44,4 @@ return {
 			Handler(Player, Value)
 		end)
 	end,
-	Game = {
-		Send = Send,
-		On = function(Name: string, Handler: (any) -> ())
-			GameNet[Name]:onClient(Handler)
-		end,
-		Input = function(Value: any)
-			GameNet.Input:fireServer(Value)
-		end,
-		OnInput = function(Handler: (Player, any) -> ())
-			GameNet.Input:onServer(function(Value: any, Player: Player)
-				Handler(Player, Value)
-			end)
-		end,
-	},
 }

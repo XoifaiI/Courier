@@ -259,7 +259,10 @@ impl<'a> Writer<'_, '_, 'a> {
                 Tail::Array { .. } => "items",
                 _ => "bytes",
             };
-            let total = self.length(e.read(path), buffer);
+            let total = match tail {
+                Tail::Bytes { buffer: false, .. } => b.invoke(STRING_LEN, [e.read(path)]),
+                _ => self.length(e.read(path), buffer),
+            };
             match count {
                 Count::Fixed(0) => {}
                 Count::Fixed(fixed) => out.push(self.too_short(total, fixed, path, unit)),
@@ -875,10 +878,19 @@ impl<'a> Writer<'_, '_, 'a> {
             out.push(self.room(Some(b.mul(total, b.number(element_node.bits)))));
         }
         if e.layout.is_bare_bool(element) && !matches!(count, Count::Fixed(fixed) if *fixed < BOOLS_PER_ADD) {
-            out.extend(self.bool_array(e.read(path), total));
+            out.extend(if self.aligned.get() {
+                self.bool_bytes(e.read(path), total)
+            } else {
+                self.bool_array(e.read(path), total)
+            });
             return out;
         }
         if let Some(writes) = self.whole_writes(element) {
+            if let [write @ (WRITEU8 | WRITEU16)] = writes[..] {
+                let array = e.read(path);
+                out.extend(self.grouped_array(element, write, array, total, item, position, body));
+                return out;
+            }
             out.extend(self.whole_array(element, &writes, total, position, body));
             return out;
         }
@@ -1011,10 +1023,22 @@ impl<'a> Writer<'_, '_, 'a> {
         prefix: Block<'a>,
     ) -> Block<'a> {
         let (e, b) = (self.e, self.e.b);
-        let bytes = e.layout.node(element).bits / 8;
         let byte = e.temp('B');
         let mut body = prefix;
-        body.extend(e.scope(e.layout.node(element).base, || {
+        body.extend(self.whole_item(element, writes, byte));
+        vec![
+            Stmt::Do(vec![
+                local(byte, b.floor_div(self.cursor(), b.number(8))),
+                Stmt::For(position, b.number(1), total, body),
+            ]),
+            increase(self.cursor(), b.mul(total, b.number(e.layout.node(element).bits))),
+        ]
+    }
+
+    fn whole_item(&self, element: NodeId, writes: &[&'static str], byte: Name<'a>) -> Block<'a> {
+        let (e, b) = (self.e, self.e.b);
+        let bytes = e.layout.node(element).bits / 8;
+        e.scope(e.layout.node(element).base, || {
             let locals = Locals::new(e, element);
             let mut out = self.early(element, &locals);
             self.raw_floats.set(true);
@@ -1030,13 +1054,59 @@ impl<'a> Writer<'_, '_, 'a> {
             }
             out.push(increase(b.name(byte), b.number(bytes)));
             out
-        }));
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn grouped_array(
+        &self,
+        element: NodeId,
+        write: &'static str,
+        array: ExprId,
+        total: ExprId,
+        item: Name<'a>,
+        position: Name<'a>,
+        prefix: Block<'a>,
+    ) -> Block<'a> {
+        let (e, b) = (self.e, self.e.b);
+        let base = e.layout.node(element).base;
+        let bits = e.layout.node(element).bits;
+        let factor = 32 / bits;
+        let (byte, step, end) = (e.temp('B'), e.temp('P'), e.temp('E'));
+        let mut group = vec![local(end, b.mul(b.name(step), b.number(factor)))];
+        let mut terms = Vec::new();
+        for at in 0..factor {
+            let held = e.temp('X');
+            e.bind(base, Base::Local(held));
+            let back = f64::from(factor - 1 - at);
+            let index = if back == 0.0 { b.name(end) } else { b.minus(b.name(end), back) };
+            group.push(local(held, b.index(array, index)));
+            let mut value = None;
+            group.extend(e.scope(base, || {
+                let locals = Locals::new(e, element);
+                let mut out = self.early(element, &locals);
+                out.extend(self.stores(element, &locals));
+                value = Some(locals.leaves[0]);
+                out
+            }));
+            let value = b.name(value.expect("a single leaf"));
+            let weight = 1u64 << (at * bits);
+            terms.push(if weight == 1 { value } else { b.mul(value, b.hex(weight)) });
+        }
+        group.push(Stmt::Call(b.invoke(WRITEU32, [self.stream(), b.name(byte), b.sum(terms)])));
+        group.push(increase(b.name(byte), b.number(4)));
+        e.bind(base, Base::Local(item));
+        let mut single = prefix;
+        single.extend(self.whole_item(element, &[write], byte));
+        let groups = b.floor_div(total, b.number(factor));
+        let done = b.mul(groups, b.number(factor));
         vec![
             Stmt::Do(vec![
                 local(byte, b.floor_div(self.cursor(), b.number(8))),
-                Stmt::For(position, b.number(1), total, body),
+                Stmt::For(step, b.number(1), groups, group),
+                Stmt::For(position, b.add(done, b.number(1)), total, single),
             ]),
-            increase(self.cursor(), b.mul(total, b.number(e.layout.node(element).bits))),
+            increase(self.cursor(), b.mul(total, b.number(bits))),
         ]
     }
 
@@ -1083,10 +1153,9 @@ impl<'a> Writer<'_, '_, 'a> {
         let (e, b) = (self.e, self.e.b);
         let names = [e.temp('B'), e.temp('F'), e.temp('G'), e.temp('Q')];
         let [byte, fill, scale, acc] = names;
-        let (step, end, value, position) = (e.temp('P'), e.temp('E'), e.temp('V'), e.temp('I'));
+        let (step, value, position) = (e.temp('P'), e.temp('V'), e.temp('I'));
         let bit = |index: ExprId, weight: u64| b.if_else(b.index(array, index), b.hex(weight), b.number(0));
-        let terms = (0..BOOLS_PER_ADD).map(|at| bit(b.minus(b.name(end), f64::from(BOOLS_PER_ADD - 1 - at)), 1 << at));
-        let mut adds = vec![local(end, b.mul(b.name(step), b.number(BOOLS_PER_ADD))), number(value, b.sum(terms))];
+        let mut adds = self.bool_group(array, step, value);
         let whole_scale = b.number((1u64 << BOOLS_PER_ADD) as f64);
         adds.extend(self.accumulate(names, b.name(value), whole_scale, b.number(BOOLS_PER_ADD)));
         let single = self.accumulate(names, bit(b.name(position), 1), b.number(2), b.number(1));
@@ -1105,6 +1174,50 @@ impl<'a> Writer<'_, '_, 'a> {
             ]),
             increase(self.cursor(), total),
         ]
+    }
+
+    fn bool_bytes(&self, array: ExprId, total: ExprId) -> Block<'a> {
+        let (e, b) = (self.e, self.e.b);
+        let (byte, step, value) = (e.temp('B'), e.temp('P'), e.temp('V'));
+        let (position, rest, scale) = (e.temp('I'), e.temp('Q'), e.temp('G'));
+        let groups = b.floor_div(total, b.number(BOOLS_PER_ADD));
+        let done = b.mul(groups, b.number(BOOLS_PER_ADD));
+        let mut each = self.bool_group(array, step, value);
+        each.push(Stmt::Call(b.invoke(WRITEU8, [self.stream(), b.add(b.name(byte), b.name(step)), b.name(value)])));
+        let single = vec![
+            increase(b.name(rest), b.if_else(b.index(array, b.name(position)), b.name(scale), b.number(0))),
+            increase(b.name(scale), b.name(scale)),
+        ];
+        vec![
+            Stmt::Do(vec![
+                local(byte, b.minus(b.floor_div(self.cursor(), b.number(8)), 1.0)),
+                Stmt::For(step, b.number(1), groups, each),
+                local(rest, b.number(0)),
+                local(scale, b.number(1)),
+                Stmt::For(position, b.add(done, b.number(1)), total, single),
+                Stmt::Call(
+                    b.invoke(WRITEU8, [self.stream(), b.add(b.name(byte), b.add(groups, b.number(1))), b.name(rest)]),
+                ),
+            ]),
+            increase(self.cursor(), total),
+        ]
+    }
+
+    fn bool_group(&self, array: ExprId, step: Name<'a>, value: Name<'a>) -> Block<'a> {
+        let (e, b) = (self.e, self.e.b);
+        let end = e.temp('E');
+        let bools: Vec<Name<'a>> = (0..BOOLS_PER_ADD).map(|_| e.temp('A')).collect();
+        let mut out = vec![local(end, b.mul(b.name(step), b.number(BOOLS_PER_ADD)))];
+        for (at, held) in bools.iter().enumerate() {
+            let back = f64::from(BOOLS_PER_ADD - 1) - at as f64;
+            let index = if back == 0.0 { b.name(end) } else { b.minus(b.name(end), back) };
+            out.push(local(*held, b.index(array, index)));
+        }
+        out.push(number(value, b.number(0)));
+        for (at, held) in bools.iter().enumerate() {
+            out.push(when(b.name(*held), vec![increase(b.name(value), b.hex(1 << at))]));
+        }
+        out
     }
 
     fn accumulate(&self, names: [Name<'a>; 4], value: ExprId, scale_by: ExprId, bits: ExprId) -> Block<'a> {

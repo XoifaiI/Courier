@@ -1,17 +1,9 @@
 --!strict
 
-export type Game = {
-	Send: { [string]: (Player, any) -> () },
-	On: (Name: string, Handler: (any) -> ()) -> (),
-	Input: (Value: any) -> (),
-	OnInput: (Handler: (Player, any) -> ()) -> (),
-}
-
 export type Library = {
 	Tests: { string },
 	Fire: { [string]: (Value: any) -> () },
 	On: (Test: string, Handler: (Player, any) -> ()) -> (),
-	Game: Game,
 }
 
 type Entry = { Vendor: string?, Runtime: string?, Load: () -> Library }

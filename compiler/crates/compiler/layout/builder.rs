@@ -428,7 +428,8 @@ impl<'a> Builder<'a> {
                     && chunk.is_none()
                     && self.layout.tails(node).is_empty()
                     && element_bits > 0
-                    && element_bits.is_multiple_of(8);
+                    && (element_bits.is_multiple_of(8)
+                        || (self.layout.is_bare_bool(node) && !matches!(count, Count::Fixed(fixed) if fixed < 8)));
                 Ok(self.tail(Tail::Array { path, count, element: node, chunk, padded }))
             }
             Type::Instance { class } => Ok(self.tail(Tail::Instance { path, class: class.as_deref(), handle: false })),

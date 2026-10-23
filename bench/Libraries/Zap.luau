@@ -17,14 +17,4 @@ return {
 	On = function(Test: string, Handler: (Player, any) -> ())
 		Net[Test].SetCallback(Handler)
 	end,
-	Game = {
-		Send = { State = Net.State.Fire, Hit = Net.Hit.Fire, Pickup = Net.Pickup.Fire, Chat = Net.Chat.Fire },
-		On = function(Name: string, Handler: (any) -> ())
-			Net[Name].SetCallback(Handler)
-		end,
-		Input = Net.Input.Fire,
-		OnInput = function(Handler: (Player, any) -> ())
-			Net.Input.SetCallback(Handler)
-		end,
-	},
 }

@@ -38,6 +38,8 @@ pub struct Reader<'f, 'e, 'a> {
     aligned: Cell<bool>,
     head_end: Cell<Option<Name<'a>>>,
     item_byte: Cell<Option<ExprId>>,
+    unfinite: Cell<Option<Name<'a>>>,
+    raw: Cell<Option<Name<'a>>>,
 }
 
 impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
@@ -51,6 +53,8 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
             aligned: Cell::new(false),
             head_end: Cell::new(None),
             item_byte: Cell::new(None),
+            unfinite: Cell::new(None),
+            raw: Cell::new(None),
         }
     }
 
@@ -650,9 +654,16 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                     let mut body = Vec::new();
                     let has_tails = !e.layout.tails(*element).is_empty();
                     let indexed = *padded && !has_tails && !self.bare_instance(*element);
+                    let floats =
+                        indexed && e.layout.leaves(*element).iter().any(|leaf| self.direct(leaf) == Some(READF32));
+                    let unfinite = e.temp('U');
+                    if floats {
+                        out.push(local(unfinite, b.number(0)));
+                        self.unfinite.set(Some(unfinite));
+                    }
+                    let base = e.temp('B');
                     if indexed {
                         let bytes = element_node.bits / 8;
-                        let base = e.temp('B');
                         out.push(local(base, b.sub(b.floor_div(self.cursor(), b.number(8)), b.number(bytes))));
                         let step = if bytes == 1 { b.name(position) } else { b.mul(b.name(position), b.number(bytes)) };
                         self.item_byte.set(Some(b.add(b.name(base), step)));
@@ -674,7 +685,53 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
                     } else {
                         body.push(assign(b.index(b.name(held), b.name(position)), value));
                     }
-                    out.push(Stmt::For(position, b.number(1), total, body));
+                    let grouped = indexed
+                        && matches!(e.layout.leaves(*element), [leaf] if matches!(self.direct(leaf), Some(READU8 | READU16)));
+                    if grouped {
+                        let bytes = element_node.bits / 8;
+                        let factor = 4 / bytes;
+                        let (step, end, first) = (e.temp('P'), e.temp('E'), e.temp('F'));
+                        let back = f64::from(factor - 1);
+                        let start = b.minus(b.name(end), back);
+                        let offset = if bytes == 1 { start } else { b.mul(start, b.number(bytes)) };
+                        let mut group = vec![
+                            local(end, b.mul(b.name(step), b.number(factor))),
+                            local(first, b.add(b.name(base), offset)),
+                        ];
+                        let check_max = e.layout.leaves(*element)[0].check_max;
+                        let mut raws = Vec::new();
+                        for at in 0..factor {
+                            let byte = if at == 0 { b.name(first) } else { b.add(b.name(first), b.number(at * bytes)) };
+                            self.item_byte.set(Some(byte));
+                            if check_max.is_some() {
+                                let raw = e.temp('R');
+                                group.push(Stmt::Local(raw, Some("number".into()), None));
+                                self.raw.set(Some(raw));
+                                raws.push(b.name(raw));
+                            }
+                            let value = self.node_read(*element, false, None, &mut group);
+                            self.raw.set(None);
+                            let ahead = f64::from(factor - 1 - at);
+                            let index = if ahead == 0.0 { b.name(end) } else { b.minus(b.name(end), ahead) };
+                            group.push(assign(b.index(b.name(held), index), value));
+                        }
+                        if let Some(max) = check_max {
+                            let pairs =
+                                raws.chunks(2).map(|pair| b.invoke(MAX, [pair[0], pair[1]])).collect::<Vec<_>>();
+                            let highest = if let [one, two] = pairs[..] { b.invoke(MAX, [one, two]) } else { pairs[0] };
+                            group.push(when(b.gt(highest, b.number(max as f64)), vec![self.refuse()]));
+                        }
+                        let groups = b.floor_div(total, b.number(factor));
+                        out.push(Stmt::For(step, b.number(1), groups, group));
+                        let done = b.mul(groups, b.number(factor));
+                        out.push(Stmt::For(position, b.add(done, b.number(1)), total, body));
+                    } else {
+                        out.push(Stmt::For(position, b.number(1), total, body));
+                    }
+                    if floats {
+                        self.unfinite.set(None);
+                        out.push(when(b.ne(b.name(unfinite), b.number(0)), vec![self.refuse()]));
+                    }
                     if indexed {
                         self.item_byte.set(None);
                         out.push(increase(self.cursor(), b.mul(total, b.number(element_node.bits))));
@@ -803,25 +860,30 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         let (bytes, base, shift, bits, end, position) =
             (e.temp('N'), e.temp('B'), e.temp('F'), e.temp('R'), e.temp('E'), e.temp('P'));
         out.push(local(bytes, b.floor_div(total, b.number(8))));
-        let word = b.invoke(READU32, [self.source(), b.add(b.name(base), b.name(position))]);
-        let mut body = vec![
-            local(bits, b.invoke(RSHIFT, [word, b.name(shift)])),
-            local(end, b.mul(b.name(position), b.number(8))),
-        ];
+        let aligned = self.aligned.replace(false);
+        let at = b.add(b.name(base), b.name(position));
+        let word = if aligned {
+            b.invoke(READU8, [self.source(), at])
+        } else {
+            b.invoke(RSHIFT, [b.invoke(READU32, [self.source(), at]), b.name(shift)])
+        };
+        let mut body = vec![local(bits, word), local(end, b.mul(b.name(position), b.number(8)))];
         for bit in 0..8u32 {
             let target = b.index(b.name(held), b.minus(b.name(end), f64::from(7 - bit)));
             body.push(assign(target, b.invoke(BTEST, [b.name(bits), b.hex(1 << bit)])));
         }
-        out.push(Stmt::Do(vec![
-            local(base, b.sub(b.floor_div(self.cursor(), b.number(8)), b.number(1))),
-            local(shift, b.invoke(BAND, [self.cursor(), b.number(7)])),
-            Stmt::For(position, b.number(1), b.name(bytes), body),
-        ]));
+        let mut walk = vec![local(base, b.sub(b.floor_div(self.cursor(), b.number(8)), b.number(1)))];
+        if !aligned {
+            walk.push(local(shift, b.invoke(BAND, [self.cursor(), b.number(7)])));
+        }
+        walk.push(Stmt::For(position, b.number(1), b.name(bytes), body));
+        out.push(Stmt::Do(walk));
         let whole = b.mul(b.name(bytes), b.number(8));
         out.push(increase(self.cursor(), whole));
         let index = e.temp('I');
         let mut rest = Vec::new();
         let value = self.node_read(element, false, None, &mut rest);
+        self.aligned.set(aligned);
         rest.push(assign(b.index(b.name(held), b.name(index)), value));
         out.push(Stmt::For(index, b.add(whole, b.number(1)), total, rest));
     }
@@ -987,12 +1049,24 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
             return vec![assign(target, self.flag_value(leaf))];
         }
         let checked = e.temp('S');
+        if let Some(sum) = self.unfinite.get()
+            && self.direct(leaf) == Some(READF32)
+        {
+            return vec![
+                local(checked, self.extract(leaf)),
+                increase(b.name(sum), b.mul(b.name(checked), b.number(0))),
+                assign(target, self.leaf_value(leaf, b.name(checked))),
+            ];
+        }
         if let Some(refused) = self.non_finite(leaf, b.name(checked)) {
             return vec![
                 local(checked, self.extract(leaf)),
                 when(refused, vec![self.refuse()]),
                 assign(target, self.leaf_value(leaf, b.name(checked))),
             ];
+        }
+        if let (Some(raw), Some(_)) = (self.raw.get(), leaf.check_max) {
+            return vec![assign(b.name(raw), self.extract(leaf)), assign(target, self.leaf_value(leaf, b.name(raw)))];
         }
         match leaf.check_max {
             Some(max) => vec![

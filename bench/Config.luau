@@ -1,7 +1,7 @@
 --!strict
 
 export type Config = {
-	Run: "Throughput" | "Game" | "Attack" | "Cpu",
+	Run: "Throughput" | "Attack",
 	Libraries: { string }?,
 	Tests: { string }?,
 	Seconds: number,

@@ -10,7 +10,6 @@ local TESTS = { "Booleans", "Entities", "Strings", "Numbers", "Dict", "Vectors" 
 local CAPACITY = 4096
 
 local Byte = Squash.u8()
-local Short = Squash.u16()
 local Text = Squash.string()
 local Vector = Squash.Vector3(Squash.f32())
 local Flag = Squash.boolean()
@@ -24,11 +23,6 @@ local SERIALIZERS: { [string]: any } = {
 	Numbers = Squash.array(Byte),
 	Dict = Squash.map(Text, Byte),
 	Vectors = Squash.array(Vector),
-	State = Squash.array(Squash.record({ id = Short, position = Vector, yaw = Short, health = Byte })),
-	Hit = Squash.record({ attacker = Short, target = Short, damage = Byte }),
-	Pickup = Squash.record({ item = Short, slot = Byte }),
-	Chat = Text,
-	Input = Squash.record({ move = Vector, look = Vector, jump = Flag, fire = Flag, crouch = Flag }),
 }
 
 local Cursor = Squash.cursor(CAPACITY)
@@ -67,14 +61,6 @@ for _, Test in TESTS do
 	end
 end
 
-local Send: { [string]: (Player, any) -> () } = {}
-for _, Name in { "State", "Hit", "Pickup", "Chat" } do
-	local Target = Remotes[Name]
-	Send[Name] = function(Player: Player, Value: any)
-		Target:FireClient(Player, Write(Name, Value))
-	end
-end
-
 return {
 	Tests = TESTS,
 	Fire = Fire,
@@ -85,22 +71,4 @@ return {
 			end
 		end)
 	end,
-	Game = {
-		Send = Send,
-		On = function(Name: string, Handler: (any) -> ())
-			Remotes[Name].OnClientEvent:Connect(function(Data: buffer)
-				Handler(Read(Name, Data))
-			end)
-		end,
-		Input = function(Value: any)
-			Remotes.Input:FireServer(Write("Input", Value))
-		end,
-		OnInput = function(Handler: (Player, any) -> ())
-			Remotes.Input.OnServerEvent:Connect(function(Player: Player, Data: unknown)
-				if typeof(Data) == "buffer" then
-					Handler(Player, Read("Input", Data))
-				end
-			end)
-		end,
-	},
 }

@@ -18,9 +18,6 @@
 				"Tests": {
 					"$path": "Tests.luau"
 				},
-				"Scenario": {
-					"$path": "Scenario.luau"
-				},
 				"Libraries": {
 					"$path": "Libraries"
 				},

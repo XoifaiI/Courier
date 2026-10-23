@@ -32,6 +32,7 @@ pub const ROUND: &str = "math.round";
 
 pub const TABLE_CREATE: &str = "table.create";
 pub const TABLE_CLONE: &str = "table.clone";
+pub const STRING_LEN: &str = "string.len";
 pub const TYPEOF: &str = "typeof";
 pub const ERROR: &str = "error";
 pub const REQUIRE: &str = "require";
