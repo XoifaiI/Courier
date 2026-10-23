@@ -1,0 +1,43 @@
+name: Wally
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Check the version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          Version=$(sed -n 's/^version = "\(.*\)"$/\1/p' packaging/wally.toml)
+          if [ "v$Version" != "$TAG" ]; then
+            echo "packaging/wally.toml says $Version, but the release is $TAG"
+            exit 1
+          fi
+      - name: Assemble the package
+        run: |
+          mkdir -p dist/courier
+          cp -r src LICENSE packaging/wally.toml packaging/default.project.json dist/courier/
+      - name: Install Wally
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.3.2 --repo UpliftGames/wally -p "wally-v0.3.2-linux.zip" -D "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP/wally-v0.3.2-linux.zip" -d "$RUNNER_TEMP/wally"
+          chmod +x "$RUNNER_TEMP/wally/wally"
+      - name: Publish
+        working-directory: dist/courier
+        env:
+          WALLY_TOKEN: ${{ secrets.WALLY_TOKEN }}
+        run: |
+          "$RUNNER_TEMP/wally/wally" login --token "$WALLY_TOKEN"
+          "$RUNNER_TEMP/wally/wally" publish

@@ -59,22 +59,8 @@ jobs:
           name: courier-vscode
           path: editors/vscode/courier.vsix
 
-  wally:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Assemble the Wally package
-        run: |
-          mkdir -p dist/courier
-          cp -r src LICENSE packaging/wally.toml packaging/default.project.json dist/courier/
-          cd dist && zip -qr "../courier-wally-${GITHUB_REF_NAME}.zip" courier
-      - uses: actions/upload-artifact@v7
-        with:
-          name: courier-wally
-          path: courier-wally-*.zip
-
   draft:
-    needs: [compiler, extension, wally]
+    needs: [compiler, extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
