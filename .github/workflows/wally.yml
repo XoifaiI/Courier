@@ -39,5 +39,9 @@ jobs:
         env:
           WALLY_TOKEN: ${{ secrets.WALLY_TOKEN }}
         run: |
+          set -o pipefail
           "$RUNNER_TEMP/wally/wally" login --token "$WALLY_TOKEN"
-          "$RUNNER_TEMP/wally/wally" publish
+          "$RUNNER_TEMP/wally/wally" publish 2>&1 | tee "$RUNNER_TEMP/publish.log"
+          if grep -q "^Error" "$RUNNER_TEMP/publish.log"; then
+            exit 1
+          fi
