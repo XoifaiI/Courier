@@ -218,8 +218,8 @@ but its safe to safe it is competitive with others.
 | BlinkBlox      |      1476 |       180 |
 | NetRayCompile  |       400 |      1326 |
 | Squash         |       871 |       869 |
-| **Courier**    |       974 |       913 |
 | Lync           |      2231 |      1826 |
+| **Courier**    |      2538 |      1582 |
 | BitNet         |      1566 |      3095 |
 | Packet         |      2678 |      2288 |
 | Satset         |      2603 |      7657 |

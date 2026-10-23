@@ -10,7 +10,7 @@ export type Config = {
 }
 
 local Config: Config = {
-	Run = "Game",
+	Run = "Throughput",
 	Libraries = nil,
 	Tests = nil,
 	Seconds = 1,
