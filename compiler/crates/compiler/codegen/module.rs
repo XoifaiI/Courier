@@ -237,7 +237,7 @@ fn chunk_tables<'a>(e: &Emitter<'_, 'a>) -> Vec<Stmt<'a>> {
 fn runtime_types<'a>() -> [Stmt<'a>; 2] {
     [
         alias("Future", "<T...>", TypeBody::Inline("Courier.Future<T...>".into())),
-        alias("Middleware", "<T>", TypeBody::Inline("Courier.Middleware<T>".into())),
+        alias("Middleware", "<T, A = { any }>", TypeBody::Inline("Courier.Middleware<T, A>".into())),
     ]
 }
 

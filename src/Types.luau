@@ -59,28 +59,28 @@ export type Metadata = {
 	read Direction: Direction,
 }
 
-export type Call = {
+export type Call<A = { any }> = {
 	read Shared: { [any]: any },
 	read Metadata: Metadata,
-	read Args: { any },
+	read Args: A,
 	read Count: number,
 	State: Result<any, any>,
 
-	read Reject: (self: Call, Reason: any) -> (),
+	read Reject: (self: any, Reason: any) -> (),
 }
 
-export type MiddlewareCallback<T> = (Call, Decompose<T>) -> ()
+export type MiddlewareCallback<T, A = { any }> = (Call<A>, Decompose<T>) -> ()
 
-type MiddlewareImpl<T> = {
-	__index: MiddlewareImpl<T>,
-	GetDataFor: (self: Middleware<T>, EventName: string) -> T,
+type MiddlewareImpl<T, A> = {
+	__index: MiddlewareImpl<T, A>,
+	GetDataFor: (self: Middleware<T, A>, EventName: string) -> T,
 }
 
-export type Middleware<T> = setmetatable<{
+export type Middleware<T, A = { any }> = setmetatable<{
 	Template: T,
 	EventData: { [string]: T },
-	Callback: MiddlewareCallback<T>,
-}, MiddlewareImpl<T>>
+	read Callback: MiddlewareCallback<T, A>,
+}, MiddlewareImpl<T, A>>
 
 export type Middlewares = {
 	read Ratelimiter: Middleware<RateLimiter>,

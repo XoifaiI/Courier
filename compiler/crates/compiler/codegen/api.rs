@@ -3,7 +3,7 @@
 use super::emitter::Emitter;
 use super::module::Mode;
 use super::reader::handlers_table;
-use super::types::{Typed, fields_typed, handler_type, parameters, returns};
+use super::types::{Typed, fields_typed, handler_type, parameters, payload_type, returns};
 use super::writer::{writer, writer_name};
 use crate::layout::EventLayout;
 use crate::luau::builtins::{ERROR, LEN};
@@ -117,7 +117,8 @@ impl<'a> Api<'_, '_, 'a> {
             self.expect_side(&format!("{label}.AddMiddleware"), receiver == Side::Server),
             Stmt::Call(b.method(record, "AddMiddleware", [b.fixed("Middleware")])),
         ];
-        Method::new("AddMiddleware", vec![Typed::new("Middleware", "Middleware<any>")], "", body)
+        let payload = payload_type(self.e.schema, &self.e.schema.events[event.event]);
+        Method::new("AddMiddleware", vec![Typed::new("Middleware", format!("Middleware<any, {payload}>"))], "", body)
     }
 
     fn fires(&self, event: &EventLayout) -> Vec<Method<'a>> {

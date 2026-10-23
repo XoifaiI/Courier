@@ -90,6 +90,21 @@ pub fn handler_type(schema: &Schema, event: &Event, mode: Mode) -> Option<String
     }
 }
 
+pub fn payload_type(schema: &Schema, event: &Event) -> String {
+    let fields = match event.role {
+        Role::Request(_) => &event.fields[1..],
+        Role::Message | Role::Reply(_) => &event.fields[..],
+    };
+    let mut types: Vec<String> = Vec::new();
+    for field in fields {
+        let ty = luau_type(schema, field.ty, false);
+        if !types.contains(&ty) {
+            types.push(ty);
+        }
+    }
+    if types.is_empty() { "{ never }".to_string() } else { format!("{{ {} }}", types.join(" | ")) }
+}
+
 pub fn screaming(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 4);
     for (position, character) in text.chars().enumerate() {
@@ -113,6 +128,17 @@ mod tests {
     fn screaming_splits_words() {
         assert_eq!(screaming("WeaponKind"), "WEAPON_KIND");
         assert_eq!(screaming("Hit"), "HIT");
+    }
+
+    #[test]
+    fn payloads_list_each_field_type_once() {
+        let schema = crate::schema::parse(
+            "event Move from Client { X: u8, Y: u8, Name: string(..8) }
+event Ping from Client {}",
+        )
+        .expect("the schema parses");
+        assert_eq!(payload_type(&schema, &schema.events[0]), "{ number | string }");
+        assert_eq!(payload_type(&schema, &schema.events[1]), "{ never }");
     }
 
     #[test]

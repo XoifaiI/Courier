@@ -25,18 +25,18 @@ local Result = require("@self/Result")
 
 local Spawn = Future.Spawn
 
-type Call = Types.Call
 type Config = Types.Config
 type Event = Types.Event
 type Metadata = Types.Metadata
-type MiddlewareCallback<T> = Types.MiddlewareCallback<T>
+type MiddlewareCallback<T, A = { any }> = Types.MiddlewareCallback<T, A>
 type Reply = Types.Reply
 type Schema = Types.Schema
 type Stream = Types.Stream
 type Done = (Success: boolean, ...any) -> ()
 
+export type Call<A = { any }> = Types.Call<A>
 export type Future<T...> = Types.Future<T...>
-export type Middleware<T> = Types.Middleware<T>
+export type Middleware<T, A = { any }> = Types.Middleware<T, A>
 
 local IS_SERVER = RunService:IsServer()
 
@@ -333,7 +333,7 @@ function EventProto.HandleInvoke(self: Event, Handler: any, Sender: Player?, Cal
 	Spawn(self.Respond, self, Handler, Sender, CallId, ...)
 end
 
-function Courier.Middleware<T>(Callback: MiddlewareCallback<T>, Template: T?): Middleware<T>
+function Courier.Middleware<T, A>(Callback: MiddlewareCallback<T, A>, Template: T?): Middleware<T, A>
 	return setmetatable(
 		{
 			Template = Template,

@@ -12,7 +12,7 @@
 local Types = require("./Types")
 
 type Middlewares = Types.Middlewares
-type Maker = { Middleware: <T>(Callback: Types.MiddlewareCallback<T>, Template: T?) -> Types.Middleware<T> }
+type Maker = { Middleware: <T, A>(Callback: Types.MiddlewareCallback<T, A>, Template: T?) -> Types.Middleware<T, A> }
 
 return function(Courier: Maker): Middlewares
 	return table.freeze({

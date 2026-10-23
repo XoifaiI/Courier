@@ -14,7 +14,7 @@ local Types = require("../Types")
 type Bucket = Types.Bucket
 type Middleware<T> = Types.Middleware<T>
 type RateLimiter = Types.RateLimiter
-type Maker = { Middleware: <T>(Callback: Types.MiddlewareCallback<T>, Template: T?) -> Middleware<T> }
+type Maker = { Middleware: <T, A>(Callback: Types.MiddlewareCallback<T, A>, Template: T?) -> Types.Middleware<T, A> }
 
 local function Refill(Bucket: Bucket, Now: number, Capacity: number, Rate: number)
 	local Elapsed = Now - Bucket.Last
@@ -46,7 +46,7 @@ end
 
 return function(Courier: Maker): Middleware<RateLimiter>
 	return Courier.Middleware(
-		function(Call, Data)
+		function(Call: Types.Call, Data: RateLimiter)
 			local Metadata = Call.Metadata
 
 			local Player = Metadata.Player
