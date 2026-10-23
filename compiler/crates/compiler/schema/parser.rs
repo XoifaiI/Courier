@@ -1,8 +1,10 @@
 //! Parses and checks a schema, then turns each function into a request and a reply event.
 //!
+//! A unit is every schema of one folder, read as one text in file name order, so a type may be
+//! used in any file and before it is declared.
+//!
 //! ```text
-//! Schema   := { Option | Enum | Struct | Union | Event | Function }
-//! Option   := "option" ("output" | "runtime") "=" Text
+//! Schema   := { Enum | Struct | Union | Event | Function }
 //! Enum     := "enum" Name "{" Name { "," Name } [","] "}"
 //! Struct   := "struct" Name "{" Field { "," Field } [","] "}"
 //! Union    := "union" Name "{" Variant { "," Variant } [","] "}"
@@ -25,7 +27,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::lexer::{Token, tokenize};
+use super::lexer::{Token, tokenize_file};
 use super::names::{KEYWORDS, RESERVED_TYPES, is_reserved_field};
 use super::types::{
     Bounds, Declaration, Enum, EnumId, Event, Field, Function, Role, Schema, Side, Struct, StructId, Type, TypeId,
@@ -38,9 +40,34 @@ const LARGEST_COUNT: f64 = 16_777_215.0;
 type Parsed<T> = Result<T, (Span, SchemaError)>;
 
 pub fn parse(source: &str) -> Result<Schema<'_>, Error> {
-    let tokens = tokenize(source).map_err(|(span, error)| Error::Schema(span, error))?;
-    let mut parser = Parser { tokens, index: 0, schema: Schema::default(), declared: HashMap::new() };
-    parser.schema().map_err(|(span, error)| Error::Schema(span, error))?;
+    parse_unit(&[("", source)])
+}
+
+pub fn parse_unit<'s>(files: &[(&str, &'s str)]) -> Result<Schema<'s>, Error> {
+    let located = |(span, error)| Error::Schema(span, error);
+    let mut tokens = Vec::new();
+    for (index, (_, source)) in files.iter().enumerate() {
+        let mut file = tokenize_file(source, index as u32).map_err(located)?;
+        if index + 1 < files.len() {
+            file.pop();
+        }
+        tokens.extend(file);
+    }
+    if tokens.is_empty() {
+        tokens.push((Token::End, Span { file: 0, line: 1, column: 1 }));
+    }
+    let mut parser = Parser {
+        types: declared_types(&tokens),
+        tokens,
+        index: 0,
+        schema: Schema::default(),
+        declared: HashMap::new(),
+        files: files.iter().map(|(name, _)| name.to_string()).collect(),
+        spans: HashMap::new(),
+        unreliable: Vec::new(),
+    };
+    parser.schema().map_err(located)?;
+    parser.check().map_err(located)?;
     let mut schema = parser.schema;
     schema.desugar();
     Ok(schema)
@@ -51,15 +78,50 @@ enum Declared {
     Enum(EnumId),
     Struct(StructId),
     Union(UnionId),
-    Open,
-    Other,
 }
 
 struct Parser<'s> {
     tokens: Vec<(Token<'s>, Span)>,
     index: usize,
     schema: Schema<'s>,
-    declared: HashMap<Cow<'s, str>, (Span, Declared)>,
+    types: HashMap<&'s str, Declared>,
+    declared: HashMap<Cow<'s, str>, Span>,
+    files: Vec<String>,
+    spans: HashMap<Declaration, Span>,
+    unreliable: Vec<(usize, Span)>,
+}
+
+fn declared_types<'s>(tokens: &[(Token<'s>, Span)]) -> HashMap<&'s str, Declared> {
+    let mut found = HashMap::new();
+    let (mut depth, mut enums, mut structs, mut unions) = (0usize, 0, 0, 0);
+    for (index, (token, _)) in tokens.iter().enumerate() {
+        match *token {
+            Token::Symbol("{") => depth += 1,
+            Token::Symbol("}") => depth = depth.saturating_sub(1),
+            Token::Name(keyword @ ("enum" | "struct" | "union")) if depth == 0 => {
+                let named = index.checked_sub(1).is_some_and(|before| {
+                    matches!(tokens[before].0, Token::Name("enum" | "struct" | "union" | "event" | "function"))
+                });
+                let Some((Token::Name(name), _)) = tokens.get(index + 1) else { continue };
+                if named {
+                    continue;
+                }
+                let declared = match keyword {
+                    "enum" => Declared::Enum(EnumId(next_id(&mut enums))),
+                    "struct" => Declared::Struct(StructId(next_id(&mut structs))),
+                    _ => Declared::Union(UnionId(next_id(&mut unions))),
+                };
+                found.entry(*name).or_insert(declared);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+fn next_id(count: &mut u32) -> u32 {
+    *count += 1;
+    *count - 1
 }
 
 impl<'s> Parser<'s> {
@@ -124,21 +186,20 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
-    fn declare(&mut self, name: Cow<'s, str>, span: Span, declared: Declared) -> Parsed<()> {
+    fn declare(&mut self, name: Cow<'s, str>, span: Span) -> Parsed<()> {
         if KEYWORDS.contains(&name.as_ref()) || RESERVED_TYPES.contains(&name.as_ref()) {
             return Err((span, SchemaError::ReservedName(name.into_owned())));
         }
-        if let Some((first, _)) = self.declared.get(&name) {
-            return Err((span, SchemaError::AlreadyDeclared { name: name.into_owned(), line: first.line }));
+        if let Some(first) = self.declared.get(&name) {
+            let at = if first.file == span.file {
+                format!("line {}", first.line)
+            } else {
+                format!("line {} of {}", first.line, self.files[first.file as usize])
+            };
+            return Err((span, SchemaError::AlreadyDeclared { name: name.into_owned(), at }));
         }
-        self.declared.insert(name, (span, declared));
+        self.declared.insert(name, span);
         Ok(())
-    }
-
-    fn close(&mut self, name: &str, declared: Declared) {
-        if let Some((_, open)) = self.declared.get_mut(name) {
-            *open = declared;
-        }
     }
 
     fn bounds(&mut self, closing: &str) -> Parsed<Bounds> {
@@ -262,12 +323,11 @@ impl<'s> Parser<'s> {
                 Some((_, width)) if !(1..=32).contains(&width) => return Err((span, SchemaError::IntWidth(width))),
                 Some((true, width)) => Type::Int { min: -(1 << (width - 1)), max: (1 << (width - 1)) - 1, wraps: true },
                 Some((false, width)) => Type::Int { min: 0, max: (1 << width) - 1, wraps: true },
-                None => match self.declared.get(name).map(|(_, declared)| *declared) {
-                    Some(Declared::Enum(id)) => Type::Enum(id),
-                    Some(Declared::Struct(id)) => Type::Struct(id),
-                    Some(Declared::Union(id)) => Type::Union(id),
-                    Some(Declared::Open) => return Err((span, SchemaError::HoldsItself(name.to_string()))),
-                    Some(Declared::Other) | None => return Err((span, SchemaError::UnknownType(name.to_string()))),
+                None => match self.types.get(name) {
+                    Some(Declared::Enum(id)) => Type::Enum(*id),
+                    Some(Declared::Struct(id)) => Type::Struct(*id),
+                    Some(Declared::Union(id)) => Type::Union(*id),
+                    None => return Err((span, SchemaError::UnknownType(name.to_string()))),
                 },
             },
         };
@@ -322,7 +382,7 @@ impl<'s> Parser<'s> {
     fn enumeration(&mut self) -> Parsed<()> {
         let (name, span) = self.name("an enum name")?;
         let id = EnumId(self.schema.enums.len() as u32);
-        self.declare(Cow::Borrowed(name), span, Declared::Enum(id))?;
+        self.declare(Cow::Borrowed(name), span)?;
         let mut values: Vec<Cow<'s, str>> = Vec::new();
         self.list(|parser| {
             let (value, span) = parser.name("an enum value")?;
@@ -343,21 +403,21 @@ impl<'s> Parser<'s> {
     fn structure(&mut self) -> Parsed<()> {
         let (name, span) = self.name("a struct name")?;
         let id = StructId(self.schema.structs.len() as u32);
-        self.declare(Cow::Borrowed(name), span, Declared::Open)?;
+        self.declare(Cow::Borrowed(name), span)?;
         let fields = self.fields(false)?;
-        self.close(name, Declared::Struct(id));
         if fields.is_empty() {
             return Err((span, SchemaError::EmptyStruct));
         }
         self.schema.structs.push(Struct { name: Cow::Borrowed(name), fields });
         self.schema.declarations.push(Declaration::Struct(id));
+        self.spans.insert(Declaration::Struct(id), span);
         Ok(())
     }
 
     fn union(&mut self) -> Parsed<()> {
         let (name, span) = self.name("a union name")?;
         let id = UnionId(self.schema.unions.len() as u32);
-        self.declare(Cow::Borrowed(name), span, Declared::Open)?;
+        self.declare(Cow::Borrowed(name), span)?;
         let mut variants: Vec<Variant<'s>> = Vec::new();
         self.list(|parser| {
             let (variant, span) = parser.name("a variant name")?;
@@ -374,9 +434,9 @@ impl<'s> Parser<'s> {
         if variants.len() < 2 {
             return Err((span, SchemaError::TooFewVariants));
         }
-        self.close(name, Declared::Union(id));
         self.schema.unions.push(Union { name: Cow::Borrowed(name), variants });
         self.schema.declarations.push(Declaration::Union(id));
+        self.spans.insert(Declaration::Union(id), span);
         Ok(())
     }
 
@@ -394,25 +454,23 @@ impl<'s> Parser<'s> {
 
     fn event(&mut self) -> Parsed<()> {
         let (name, span) = self.name("an event name")?;
-        self.declare(Cow::Borrowed(name), span, Declared::Other)?;
+        self.declare(Cow::Borrowed(name), span)?;
         let from = self.side()?;
         let reliable = self.peek() != Token::Name("unreliable");
         if !reliable {
             self.next();
+            self.unreliable.push((self.schema.events.len(), span));
         }
         let fields = self.fields(true)?;
-        if !reliable && fields.iter().any(|field| self.schema.holds_instance(field.ty)) {
-            return Err((span, SchemaError::UnreliableInstances(name.to_string())));
-        }
         self.schema.events.push(Event { name: Cow::Borrowed(name), from, reliable, role: Role::Message, fields });
         Ok(())
     }
 
     fn function(&mut self) -> Parsed<()> {
         let (name, span) = self.name("a function name")?;
-        self.declare(Cow::Borrowed(name), span, Declared::Other)?;
-        self.declare(Cow::Owned(format!("{name}Reply")), span, Declared::Other)?;
-        self.declare(Cow::Owned(format!("{name}Result")), span, Declared::Other)?;
+        self.declare(Cow::Borrowed(name), span)?;
+        self.declare(Cow::Owned(format!("{name}Reply")), span)?;
+        self.declare(Cow::Owned(format!("{name}Result")), span)?;
         let from = self.side()?;
         let arguments = self.fields(true)?;
         if arguments.iter().any(|field| field.name == super::types::CALL_ID) {
@@ -421,25 +479,6 @@ impl<'s> Parser<'s> {
         self.symbol("->")?;
         let results = self.fields(true)?;
         self.schema.functions.push(Function { name: Cow::Borrowed(name), from, arguments, results });
-        Ok(())
-    }
-
-    fn option(&mut self) -> Parsed<()> {
-        let (name, span) = self.name("an option name")?;
-        self.symbol("=")?;
-        let value = match self.next() {
-            (Token::Text(text), _) => Cow::Borrowed(text),
-            token => return self.expected(token, "text in double quotes"),
-        };
-        let slot = match name {
-            "output" => &mut self.schema.output,
-            "runtime" => &mut self.schema.runtime,
-            _ => return Err((span, SchemaError::UnknownOption(name.to_string()))),
-        };
-        if slot.is_some() {
-            return Err((span, SchemaError::Repeated { kind: "option", name: name.to_string() }));
-        }
-        *slot = Some(value);
         Ok(())
     }
 
@@ -452,13 +491,66 @@ impl<'s> Parser<'s> {
                 (Token::Name("union"), _) => self.union()?,
                 (Token::Name("event"), _) => self.event()?,
                 (Token::Name("function"), _) => self.function()?,
-                (Token::Name("option"), _) => self.option()?,
                 token => {
-                    return self
-                        .expected(token, "\"option\", \"enum\", \"struct\", \"union\", \"event\" or \"function\"");
+                    return self.expected(token, "\"enum\", \"struct\", \"union\", \"event\" or \"function\"");
                 }
             }
         }
+    }
+}
+
+impl Parser<'_> {
+    fn check(&self) -> Parsed<()> {
+        for &declaration in &self.schema.declarations {
+            let name = match declaration {
+                Declaration::Struct(id) => &self.schema.structure(id).name,
+                Declaration::Union(id) => &self.schema.union(id).name,
+                Declaration::Enum(_) => continue,
+            };
+            if self.fields_of(declaration).into_iter().any(|ty| self.holds(ty, declaration, &mut Vec::new())) {
+                return Err((self.spans[&declaration], SchemaError::HoldsItself(name.to_string())));
+            }
+        }
+        for &(index, span) in &self.unreliable {
+            let event = &self.schema.events[index];
+            if event.fields.iter().any(|field| self.schema.holds_instance(field.ty)) {
+                return Err((span, SchemaError::UnreliableInstances(event.name.to_string())));
+            }
+        }
+        Ok(())
+    }
+
+    fn fields_of(&self, declaration: Declaration) -> Vec<TypeId> {
+        match declaration {
+            Declaration::Struct(id) => self.schema.structure(id).fields.iter().map(|field| field.ty).collect(),
+            Declaration::Union(id) => self
+                .schema
+                .union(id)
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .map(|field| field.ty)
+                .collect(),
+            Declaration::Enum(_) => Vec::new(),
+        }
+    }
+
+    fn holds(&self, ty: TypeId, target: Declaration, seen: &mut Vec<Declaration>) -> bool {
+        let declaration = match self.schema.ty(ty) {
+            Type::Optional(inner) | Type::Array { element: inner, .. } => return self.holds(*inner, target, seen),
+            Type::Map { key, value, .. } => return self.holds(*key, target, seen) || self.holds(*value, target, seen),
+            Type::Struct(id) => Declaration::Struct(*id),
+            Type::Union(id) => Declaration::Union(*id),
+            _ => return false,
+        };
+        if declaration == target {
+            return true;
+        }
+        if seen.contains(&declaration) {
+            return false;
+        }
+        seen.push(declaration);
+        self.fields_of(declaration).into_iter().any(|inner| self.holds(inner, target, seen))
     }
 }
 
@@ -497,14 +589,32 @@ mod tests {
     }
 
     #[test]
-    fn options_name_the_output_and_runtime() {
-        let schema =
-            parse("option output = \"src/shared/Net\"\noption runtime = \"ReplicatedStorage.Packages.Courier\"")
-                .expect("valid schema");
-        assert_eq!(schema.output.as_deref(), Some("src/shared/Net"));
-        assert_eq!(schema.runtime.as_deref(), Some("ReplicatedStorage.Packages.Courier"));
-        assert!(matches!(error("option colour = \"red\""), SchemaError::UnknownOption(_)));
-        assert!(matches!(error("option output = \"a\" option output = \"b\""), SchemaError::Repeated { .. }));
+    fn a_unit_reads_its_files_as_one() {
+        let files =
+            [("A.courier", "event Hit from Server { W: Weapon, S: Spot }"), ("B.courier", "struct Spot { X: u8 }")];
+        let schema = parse_unit(&files).map(|schema| schema.structs.len());
+        assert!(matches!(schema, Err(Error::Schema(Span { file: 0, .. }, SchemaError::UnknownType(_)))));
+        let files = [
+            ("A.courier", "event Hit from Server { W: Weapon, S: Spot }"),
+            ("B.courier", "struct Spot { X: u8 }\nenum Weapon { Sword, Bow }"),
+        ];
+        let schema = parse_unit(&files).expect("valid unit");
+        assert_eq!((schema.enums[0].name.as_ref(), schema.structs[0].name.as_ref()), ("Weapon", "Spot"));
+        let files = [("A.courier", "event Hit from Server {}"), ("B.courier", "\nevent Hit from Client {}")];
+        let Err(Error::Schema(span, SchemaError::AlreadyDeclared { at, .. })) = parse_unit(&files) else {
+            panic!("a repeated name")
+        };
+        assert_eq!((span.file, span.line, at.as_str()), (1, 2, "line 1 of A.courier"));
+    }
+
+    #[test]
+    fn types_may_be_used_before_they_are_declared() {
+        let schema = parse("event A from Server { P: Pair } struct Pair { L: Side, R: Side } enum Side { L, R }")
+            .expect("valid schema");
+        assert_eq!(schema.structs[0].name, "Pair");
+        assert!(matches!(error("struct A { B: B? } struct B { A: A[] }"), SchemaError::HoldsItself(_)));
+        let unreliable = "event E from Server unreliable { P: P } struct P { I: Instance }";
+        assert!(matches!(error(unreliable), SchemaError::UnreliableInstances(_)));
     }
 
     #[test]

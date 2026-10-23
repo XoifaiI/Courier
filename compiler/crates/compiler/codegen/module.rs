@@ -35,10 +35,16 @@ pub enum Mode {
     Api,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runtime {
+    Bundled,
+    Expression(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub mode: Mode,
-    pub runtime: String,
+    pub runtime: Runtime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,8 +208,13 @@ fn top_level_locals(statements: &[Stmt]) -> usize {
         .sum()
 }
 
-fn require_runtime<'a>(b: &Ast<'a>, options: &'a Options) -> Stmt<'a> {
-    local(Name::Fixed("Courier"), b.invoke(REQUIRE, [b.fixed(&options.runtime)]))
+fn require_runtime<'a>(b: &Ast<'a>, options: &'a Options, front: bool) -> Stmt<'a> {
+    let path = match &options.runtime {
+        Runtime::Bundled if front => b.string("@self/Courier"),
+        Runtime::Bundled => b.string("./Courier"),
+        Runtime::Expression(expression) => b.fixed(expression),
+    };
+    local(Name::Fixed("Courier"), b.invoke(REQUIRE, [path]))
 }
 
 fn chunk_tables<'a>(e: &Emitter<'_, 'a>) -> Vec<Stmt<'a>> {
@@ -244,7 +255,7 @@ fn runtime_types<'a>() -> [Stmt<'a>; 2] {
 fn front(schema: &Schema, layout: &Layout, options: &Options) -> String {
     let b = Ast::default();
     let e = Emitter::new(schema, layout, &b);
-    let mut out = vec![Stmt::Verbatim("--!strict\n".into()), Stmt::Blank, require_runtime(&b, options)];
+    let mut out = vec![Stmt::Verbatim("--!strict\n".into()), Stmt::Blank, require_runtime(&b, options, true)];
     let implementation = b.invoke(REQUIRE, [b.string("@self/Implementation")]);
     out.push(local(Name::Fixed("Implementation"), implementation));
     out.push(Stmt::Blank);
@@ -278,7 +289,7 @@ fn assemble<'a>(e: &Emitter<'_, 'a>, options: &'a Options, spill: bool) -> Vec<S
     let (mode, b) = (options.mode, e.b);
     let mut out = vec![Stmt::Verbatim("--!strict\n--!native\n--!optimize 2\n".into()), Stmt::Blank];
     if mode == Mode::Api {
-        out.push(require_runtime(b, options));
+        out.push(require_runtime(b, options, false));
         out.push(Stmt::Blank);
         out.extend(runtime_types());
     }

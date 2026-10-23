@@ -8,6 +8,9 @@
 	Set Config before requiring the schema. ReliableCapacity is how much a stream holds before it
 	sends early, and MaxFrameBytes is the biggest frame the server will read from a client
 
+	The server makes the remotes when the schema binds and listens on them before parenting them,
+	so a client never finds a remote nobody listens to
+
 	Return type: the Courier runtime
 	Example usage:
 		local Courier = require(ReplicatedStorage.Courier)
@@ -40,9 +43,8 @@ export type Middleware<T, A = { any }> = Types.Middleware<T, A>
 
 local IS_SERVER = RunService:IsServer()
 
-local Remotes = script:WaitForChild("Remotes")
-local RELIABLE = Remotes:WaitForChild("Reliable") :: RemoteEvent
-local UNRELIABLE = Remotes:WaitForChild("Unreliable") :: UnreliableRemoteEvent
+local Reliable: RemoteEvent = nil :: any
+local Unreliable: UnreliableRemoteEvent = nil :: any
 
 local Courier = {}
 
@@ -112,7 +114,7 @@ end
 
 local function Send(Stream: Stream)
 	local Frame, Instances = (Bound :: Schema).Finish(Stream)
-	local Remote: any = if StreamReliable[Stream] then RELIABLE else UNRELIABLE
+	local Remote: any = if StreamReliable[Stream] then Reliable else Unreliable
 	if IS_SERVER then
 		local Player = StreamOwner[Stream]
 		if Instances then
@@ -400,21 +402,35 @@ function Courier.Bind(Schema: Schema)
 	Schema.SetOnFull(Send)
 
 	if IS_SERVER then
+		local Remotes = Instance.new("Folder")
+		Remotes.Name = "Remotes"
+		Reliable = Instance.new("RemoteEvent")
+		Reliable.Name = "Reliable"
+		Reliable.Parent = Remotes
+		Unreliable = Instance.new("UnreliableRemoteEvent")
+		Unreliable.Name = "Unreliable"
+		Unreliable.Parent = Remotes
+		Reliable.OnServerEvent:Connect(Receive)
+		Unreliable.OnServerEvent:Connect(Receive)
+		Remotes.Parent = script
+
 		for _, Player in Players:GetPlayers() do
 			AddPlayer(Player)
 		end
 		Players.PlayerAdded:Connect(AddPlayer)
 		Players.PlayerRemoving:Connect(RemovePlayer)
-		RELIABLE.OnServerEvent:Connect(Receive)
-		UNRELIABLE.OnServerEvent:Connect(Receive)
 	else
+		local Remotes = script:WaitForChild("Remotes")
+		Reliable = Remotes:WaitForChild("Reliable") :: RemoteEvent
+		Unreliable = Remotes:WaitForChild("Unreliable") :: UnreliableRemoteEvent
+
 		local Streams = NewStreams(nil)
 		ClientStreams[1] = Streams[1]
 		ClientStreams[2] = Streams[2]
 
 		local ReadOnClient = Schema.ReadOnClient :: any
-		RELIABLE.OnClientEvent:Connect(ReadOnClient)
-		UNRELIABLE.OnClientEvent:Connect(ReadOnClient)
+		Reliable.OnClientEvent:Connect(ReadOnClient)
+		Unreliable.OnClientEvent:Connect(ReadOnClient)
 	end
 
 	RunService.Heartbeat:Connect(Flush)

@@ -1,9 +1,10 @@
 //! What the editor shows for a .courier file: errors, sizes on hover, definitions, completion and
-//! the outline. It all comes from the compiler, so it always matches what courier builds.
+//! the outline. It all comes from the compiler, so it always matches what courier builds. A file is
+//! read with the other schemas of its folder, in file name order, as courier compiles them.
 
 use courier_compiler::Span;
 use courier_compiler::layout::{EventLayout, Layout, Measure, layout, measure, varies};
-use courier_compiler::schema::{Field, Role, Schema, Token, Type, TypeId, parse, tokenize};
+use courier_compiler::schema::{Field, Role, Schema, Token, Type, TypeId, parse_unit, tokenize, tokenize_file};
 use lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, DocumentSymbol, GotoDefinitionResponse, Hover,
     HoverContents, InsertTextFormat, Location, MarkupContent, MarkupKind, Position, Range, SymbolKind, Uri,
@@ -52,7 +53,7 @@ fn span_at(text: &str, position: Position) -> Span {
         }
         units += character.len_utf16();
     }
-    Span { line: position.line + 1, column: bytes as u32 + 1 }
+    Span { file: 0, line: position.line + 1, column: bytes as u32 + 1 }
 }
 
 fn width(token: &Token) -> u32 {
@@ -67,7 +68,7 @@ fn width(token: &Token) -> u32 {
 
 fn range(text: &str, span: Span, length: u32) -> Range {
     let start = position(text, span);
-    let end = position(text, Span { line: span.line, column: span.column + length });
+    let end = position(text, Span { column: span.column + length, ..span });
     Range { start, end }
 }
 
@@ -76,41 +77,58 @@ fn token_range(text: &str, tokens: &[(Token, Span)], span: Span) -> Range {
     range(text, span, length)
 }
 
+type Tokens<'s> = Vec<(Token<'s>, Span)>;
+
+fn unit_tokens<'s>(files: &[(&str, &'s str)]) -> Vec<Tokens<'s>> {
+    files.iter().enumerate().map(|(index, (_, text))| tokenize_file(text, index as u32).unwrap_or_default()).collect()
+}
+
 pub fn diagnose(text: &str) -> Vec<Diagnostic> {
-    let tokens = tokenize(text).unwrap_or_default();
-    let problem = match parse(text) {
+    diagnose_unit(&[("", text)]).swap_remove(0)
+}
+
+pub fn diagnose_unit(files: &[(&str, &str)]) -> Vec<Vec<Diagnostic>> {
+    let mut found = vec![Vec::new(); files.len().max(1)];
+    let tokens = unit_tokens(files);
+    let problem = match parse_unit(files) {
         Err(courier_compiler::Error::Schema(span, problem)) => {
-            Some((token_range(text, &tokens, span), problem.to_string()))
+            let file = (span.file as usize).min(files.len().saturating_sub(1));
+            let range = files.get(file).map_or_else(Range::default, |(_, text)| token_range(text, &tokens[file], span));
+            Some((file, range, problem.to_string()))
         }
-        Err(other) => Some((Range::default(), other.to_string())),
+        Err(other) => Some((0, Range::default(), other.to_string())),
         Ok(schema) => match layout(&schema) {
             Ok(_) => None,
             Err(courier_compiler::Error::Layout { path, problem }) => {
-                Some((path_range(text, &tokens, &path), format!("{path}: {problem}")))
+                let (file, range) = path_range(files, &tokens, &path);
+                Some((file, range, format!("{path}: {problem}")))
             }
-            Err(other) => Some((Range::default(), other.to_string())),
+            Err(other) => Some((0, Range::default(), other.to_string())),
         },
     };
-    problem
-        .map(|(range, message)| Diagnostic {
+    if let Some((file, range, message)) = problem {
+        found[file].push(Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("courier".into()),
             message,
             ..Diagnostic::default()
-        })
-        .into_iter()
-        .collect()
+        });
+    }
+    found
 }
 
-fn path_range(text: &str, tokens: &[(Token, Span)], path: &str) -> Range {
+fn path_range(files: &[(&str, &str)], tokens: &[Tokens], path: &str) -> (usize, Range) {
     let mut steps = path.split('.');
-    let Some(first) = steps.next() else { return Range::default() };
-    let declared = tokens.windows(2).position(|pair| {
-        matches!(pair[0].0, Token::Name(word) if DECLARING.contains(&word)) && pair[1].0 == Token::Name(first)
+    let Some(first) = steps.next() else { return (0, Range::default()) };
+    let declared = tokens.iter().enumerate().find_map(|(file, tokens)| {
+        let at = tokens.windows(2).position(|pair| {
+            matches!(pair[0].0, Token::Name(word) if DECLARING.contains(&word)) && pair[1].0 == Token::Name(first)
+        })?;
+        Some((file, at + 1))
     });
-    let Some(at) = declared.map(|index| index + 1) else { return Range::default() };
-    let mut found = at;
+    let Some((file, mut found)) = declared else { return (0, Range::default()) };
+    let tokens = &tokens[file];
     for step in steps.filter(|step| *step != "[]") {
         if let Some(next) = (found + 1..tokens.len().saturating_sub(1))
             .find(|&index| tokens[index].0 == Token::Name(step) && tokens[index + 1].0 == Token::Symbol(":"))
@@ -119,7 +137,7 @@ fn path_range(text: &str, tokens: &[(Token, Span)], path: &str) -> Range {
         }
     }
     let (token, span) = &tokens[found];
-    range(text, *span, width(token))
+    (file, range(files[file].1, *span, width(token)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -372,12 +390,17 @@ fn declared_text(schema: &Schema, name: &str) -> Option<String> {
 }
 
 pub fn hover(text: &str, at: Position) -> Option<Hover> {
+    hover_unit(&[("", text)], 0, at)
+}
+
+pub fn hover_unit(files: &[(&str, &str)], current: usize, at: Position) -> Option<Hover> {
+    let text = files.get(current)?.1;
     let tokens = tokenize(text).ok()?;
     let span = span_at(text, at);
     let index = tokens.iter().position(|(token, start)| {
         start.line == span.line && start.column <= span.column && span.column < start.column + width(token)
     })?;
-    let schema = parse(text).ok()?;
+    let schema = parse_unit(files).ok()?;
     let laid = layout(&schema).ok()?;
     let markdown = match context(&tokens, index)? {
         Context::Declaration { keyword: "event" | "function", name } => {
@@ -422,18 +445,35 @@ fn declarations<'s>(tokens: &[(Token<'s>, Span)]) -> Vec<(&'s str, &'s str, Span
 }
 
 pub fn definition(text: &str, uri: &Uri, at: Position) -> Option<GotoDefinitionResponse> {
+    definition_unit(&[("", text)], std::slice::from_ref(uri), 0, at)
+}
+
+pub fn definition_unit(
+    files: &[(&str, &str)],
+    uris: &[Uri],
+    current: usize,
+    at: Position,
+) -> Option<GotoDefinitionResponse> {
+    let text = files.get(current)?.1;
     let tokens = tokenize(text).ok()?;
     let span = span_at(text, at);
     let (token, _) = tokens.iter().find(|(token, start)| {
         start.line == span.line && start.column <= span.column && span.column < start.column + width(token)
     })?;
     let Token::Name(name) = token else { return None };
-    let (_, _, declared) = declarations(&tokens).into_iter().find(|(_, declared, _)| declared == name)?;
-    let location = Location { uri: uri.clone(), range: range(text, declared, name.len() as u32) };
+    let (file, declared) = unit_tokens(files).iter().enumerate().find_map(|(file, tokens)| {
+        let (_, _, declared) = declarations(tokens).into_iter().find(|(_, declared, _)| declared == name)?;
+        Some((file, declared))
+    })?;
+    let location = Location { uri: uris.get(file)?.clone(), range: range(files[file].1, declared, name.len() as u32) };
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
 pub fn completions(text: &str) -> Vec<CompletionItem> {
+    completions_unit(&[("", text)])
+}
+
+pub fn completions_unit(files: &[(&str, &str)]) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = BASE_TYPES
         .iter()
         .map(|(label, snippet)| CompletionItem {
@@ -444,7 +484,7 @@ pub fn completions(text: &str) -> Vec<CompletionItem> {
             ..CompletionItem::default()
         })
         .collect();
-    if let Ok(tokens) = tokenize(text) {
+    for tokens in unit_tokens(files) {
         for (keyword, name, _) in declarations(&tokens) {
             let kind = match keyword {
                 "enum" => CompletionItemKind::ENUM,
@@ -484,4 +524,22 @@ pub fn symbols(text: &str) -> Vec<DocumentSymbol> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_is_read_as_one() {
+        let files = [("A.courier", "event Hit from Server { W: Weapon }"), ("B.courier", "enum Weapon { Sword, Bow }")];
+        assert!(diagnose_unit(&files).iter().all(Vec::is_empty));
+        let hovered = hover_unit(&files, 0, Position { line: 0, character: 28 }).expect("a hover on Weapon");
+        let HoverContents::Markup(shown) = hovered.contents else { panic!("markdown") };
+        assert!(shown.value.starts_with("**Weapon**"));
+        let files = [("A.courier", "event Hit from Server { W: Weapon }"), ("B.courier", "enum Weapon { Sword }")];
+        let found = diagnose_unit(&files);
+        assert!(found[0].is_empty());
+        assert_eq!(found[1][0].range.start, Position { line: 0, character: 5 });
+    }
 }

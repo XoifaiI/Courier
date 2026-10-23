@@ -12,8 +12,6 @@ a schema, and the Courier compiler turns it into strictly typed Luau that packs 
 exactly the bits it needs and validates every value it reads.
 
 ```luau
-option output = "src/shared/Net"
-
 enum Weapon { Sword, Bow, Staff }
 
 event Shoot from Client {
@@ -275,39 +273,6 @@ buffers made it hold 851 MB.
 | Roblox remotes | 0 / 120 | 0 / 120 |         - |       - |           - | 0 / 145 | 0 / 14 |    0 / 42 |        0 / 60 |              - | 0 / 418 |
 
 </details>
-
-## Installing
-
-**Compiler**, with [Rokit](https://github.com/rojo-rbx/rokit):
-
-```sh
-rokit add XoifaiI/Courier
-```
-
-Or grab a build from the [releases](https://github.com/XoifaiI/Courier/releases).
-
-**Runtime**, with Wally:
-
-```toml
-[dependencies]
-Courier = "xoifaii/courier@0.1.0"
-```
-
-Point your schema at it and start the compiler:
-
-```luau
-option runtime = "ReplicatedStorage.Packages.Courier"
-```
-
-```sh
-courier watch
-```
-
-**No Rojo?** `courier Net.courier Net.rbxmx` gives you one model with everything in it. Insert it
-into ReplicatedStorage.
-
-**VS Code**: grab the `.vsix` from the [releases](https://github.com/XoifaiI/Courier/releases) and
-run `code --install-extension courier-<version>.vsix`.
 
 ## License
 

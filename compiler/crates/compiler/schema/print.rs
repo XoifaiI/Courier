@@ -12,11 +12,6 @@ impl Schema<'_> {
     }
 
     fn write(&self, out: &mut String) -> fmt::Result {
-        for (name, value) in [("output", &self.output), ("runtime", &self.runtime)] {
-            if let Some(value) = value {
-                writeln!(out, "option {name} = \"{value}\"")?;
-            }
-        }
         for declaration in &self.declarations {
             match *declaration {
                 Declaration::Enum(id) => {

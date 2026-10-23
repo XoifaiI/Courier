@@ -126,7 +126,7 @@ pub struct Union<'s> {
     pub variants: Vec<Variant<'s>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Declaration {
     Enum(EnumId),
     Struct(StructId),
@@ -140,8 +140,6 @@ pub const REASON_LENGTH: u32 = 200;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Schema<'s> {
-    pub output: Option<Name<'s>>,
-    pub runtime: Option<Name<'s>>,
     pub types: Vec<Type<'s>>,
     pub enums: Vec<Enum<'s>>,
     pub structs: Vec<Struct<'s>>,

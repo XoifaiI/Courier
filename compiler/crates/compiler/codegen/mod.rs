@@ -8,4 +8,4 @@ mod reader;
 mod types;
 mod writer;
 
-pub use module::{File, Mode, Options, generate};
+pub use module::{File, Mode, Options, Runtime, generate};

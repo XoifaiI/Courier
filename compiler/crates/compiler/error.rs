@@ -4,6 +4,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
+    pub file: u32,
     pub line: u32,
     pub column: u32,
 }
@@ -36,8 +37,8 @@ pub enum SchemaError {
     Expected { expected: String, found: String },
     #[error("\"{0}\" is reserved by Luau or the generated code")]
     ReservedName(String),
-    #[error("\"{name}\" is already declared at line {line}")]
-    AlreadyDeclared { name: String, line: u32 },
+    #[error("\"{name}\" is already declared at {at}")]
+    AlreadyDeclared { name: String, at: String },
     #[error("{kind} \"{name}\" is repeated")]
     Repeated { kind: &'static str, name: String },
     #[error("field name \"{0}\" is a Luau keyword")]
@@ -48,7 +49,7 @@ pub enum SchemaError {
     VariantTag,
     #[error("argument name \"CallId\" is reserved for the call id")]
     CallIdArgument,
-    #[error("unknown type \"{0}\"; enums, structs and unions must be declared before use")]
+    #[error("unknown type \"{0}\"; declare it as an enum, struct or union in any schema of this folder")]
     UnknownType(String),
     #[error("\"{0}\" cannot hold itself")]
     HoldsItself(String),
@@ -74,8 +75,6 @@ pub enum SchemaError {
     OptionalMapValues,
     #[error("text needs a closing \" on the same line")]
     UnterminatedText,
-    #[error("unknown option \"{0}\"; the options are output and runtime")]
-    UnknownOption(String),
     #[error("an enum needs at least two values")]
     TooFewValues,
     #[error("a struct needs at least one field")]

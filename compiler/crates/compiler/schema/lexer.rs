@@ -26,6 +26,10 @@ impl Token<'_> {
 const SYMBOLS: [&str; 12] = ["..", "->", "{", "}", "(", ")", "[", "]", ":", ",", "?", "="];
 
 pub fn tokenize(source: &str) -> Result<Vec<(Token<'_>, Span)>, (Span, SchemaError)> {
+    tokenize_file(source, 0)
+}
+
+pub fn tokenize_file(source: &str, file: u32) -> Result<Vec<(Token<'_>, Span)>, (Span, SchemaError)> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::with_capacity(source.len() / 4);
     let mut index = 0;
@@ -33,7 +37,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token<'_>, Span)>, (Span, SchemaErr
     let mut line_start = 0;
 
     while index < bytes.len() {
-        let span = Span { line, column: (index - line_start + 1) as u32 };
+        let span = Span { file, line, column: (index - line_start + 1) as u32 };
         let byte = bytes[index];
         let rest = &source[index..];
 
@@ -68,7 +72,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token<'_>, Span)>, (Span, SchemaErr
             return Err((span, SchemaError::UnexpectedCharacter(character)));
         }
     }
-    tokens.push((Token::End, Span { line, column: (index - line_start + 1) as u32 }));
+    tokens.push((Token::End, Span { file, line, column: (index - line_start + 1) as u32 }));
     Ok(tokens)
 }
 
@@ -104,7 +108,7 @@ mod tests {
     #[test]
     fn spans_count_lines_and_columns_from_one() {
         let tokens = tokenize("a\n  b").expect("valid source");
-        assert_eq!(tokens[1].1, Span { line: 2, column: 3 });
+        assert_eq!(tokens[1].1, Span { file: 0, line: 2, column: 3 });
     }
 
     #[test]
