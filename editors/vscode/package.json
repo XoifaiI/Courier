@@ -1,10 +1,18 @@
 {
 	"name": "courier",
 	"displayName": "Courier",
-	"description": "Courier schema files: highlighting, live errors, wire sizes on hover, go to definition, completion",
-	"version": "0.1.1",
+	"description": "Courier schemas for Roblox: live errors, bit sizes inline and on hover, rename, references, completion, and compile on save",
+	"version": "0.2.0",
 	"publisher": "xoifaii",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/XoifaiI/Courier"
+	},
+	"homepage": "https://github.com/XoifaiI/Courier#readme",
+	"bugs": {
+		"url": "https://github.com/XoifaiI/Courier/issues"
+	},
 	"private": true,
 	"engines": {
 		"vscode": "^1.90.0"
@@ -42,6 +50,11 @@
 					"type": "string",
 					"default": "courier",
 					"description": "The courier compiler to run as `courier lsp`; a name on PATH, as Rokit installs it, or a full path."
+				},
+				"courier.compileOnSave": {
+					"type": "boolean",
+					"default": true,
+					"description": "Compile a schema's folder into its module whenever a schema in it is saved, as `courier watch` would."
 				}
 			}
 		},
@@ -55,7 +68,7 @@
 	},
 	"scripts": {
 		"bundle": "esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
-		"package": "npm run bundle && vsce package --no-dependencies --skip-license --allow-missing-repository"
+		"package": "npm run bundle && vsce package --no-dependencies"
 	},
 	"dependencies": {
 		"vscode-languageclient": "^9.0.1"
@@ -63,5 +76,12 @@
 	"devDependencies": {
 		"@vscode/vsce": "4.0.0",
 		"esbuild": "0.28.2"
-	}
+	},
+	"keywords": [
+		"roblox",
+		"luau",
+		"networking",
+		"schema",
+		"rojo"
+	]
 }

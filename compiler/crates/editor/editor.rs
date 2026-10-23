@@ -6,8 +6,10 @@ use courier_compiler::Span;
 use courier_compiler::layout::{EventLayout, Layout, Measure, layout, measure, varies};
 use courier_compiler::schema::{Field, Role, Schema, Token, Type, TypeId, parse_unit, tokenize, tokenize_file};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, DocumentSymbol, GotoDefinitionResponse, Hover,
-    HoverContents, InsertTextFormat, Location, MarkupContent, MarkupKind, Position, Range, SymbolKind, Uri,
+    AnnotatedTextEdit, CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, DocumentChanges,
+    DocumentSymbol, GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintLabel, InsertTextFormat,
+    Location, MarkupContent, MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, SymbolKind,
+    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 const BASE_TYPES: [(&str, &str); 20] = [
@@ -34,6 +36,14 @@ const BASE_TYPES: [(&str, &str); 20] = [
 ];
 
 const DECLARING: [&str; 5] = ["enum", "struct", "union", "event", "function"];
+
+const STARTS: [(&str, &str, &str); 5] = [
+    ("event", "event ${1:Name} from ${2|Client,Server|} {\n\t$0\n}", "a message one side sends"),
+    ("function", "function ${1:Name} from ${2|Client,Server|} { $3 } -> { $0 }", "a call that waits for results"),
+    ("enum", "enum ${1:Name} { $0 }", "one of a set of names"),
+    ("struct", "struct ${1:Name} {\n\t$0\n}", "named fields"),
+    ("union", "union ${1:Name} {\n\t$0\n}", "one of several variants"),
+];
 
 fn position(text: &str, span: Span) -> Position {
     let line = text.lines().nth(span.line as usize - 1).unwrap_or("");
@@ -389,6 +399,43 @@ fn declared_text(schema: &Schema, name: &str) -> Option<String> {
     Some(format!("**{name}**: {}{listed}", describe(&copy, ty)))
 }
 
+fn messages<'l>(schema: &Schema, laid: &'l Layout, name: &str) -> Vec<&'l EventLayout> {
+    let mut matched: Vec<&EventLayout> = laid
+        .events()
+        .map(|(_, event)| event)
+        .filter(|event| {
+            let declared = &schema.events[event.event];
+            match declared.role {
+                Role::Message => declared.name == name,
+                Role::Request(id) | Role::Reply(id) => schema.function(id).name == name,
+            }
+        })
+        .collect();
+    matched.sort_by_key(|event| matches!(schema.events[event.event].role, Role::Reply(_)));
+    matched
+}
+
+fn field_of_type(tokens: &[(Token, Span)], at: usize) -> Option<usize> {
+    for index in (1..at).rev() {
+        match tokens[index].0 {
+            Token::Symbol(":") => return matches!(tokens[index - 1].0, Token::Name(_)).then_some(index - 1),
+            Token::Symbol("{" | "}") => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn field_ty(schema: &Schema, tokens: &[(Token, Span)], at: usize) -> Option<TypeId> {
+    let Some(Context::Field { owner, name }) = context(tokens, at) else { return None };
+    fields(schema, owner)?.iter().find(|field| field.name == name).map(|field| field.ty)
+}
+
+fn field_text(schema: &Schema, tokens: &[(Token, Span)], at: usize) -> Option<String> {
+    let Token::Name(name) = tokens[at].0 else { return None };
+    Some(format!("`{name}`: {}", describe(schema, field_ty(schema, tokens, at)?)))
+}
+
 pub fn hover(text: &str, at: Position) -> Option<Hover> {
     hover_unit(&[("", text)], 0, at)
 }
@@ -404,26 +451,16 @@ pub fn hover_unit(files: &[(&str, &str)], current: usize, at: Position) -> Optio
     let laid = layout(&schema).ok()?;
     let markdown = match context(&tokens, index)? {
         Context::Declaration { keyword: "event" | "function", name } => {
-            let mut matched: Vec<&EventLayout> = laid
-                .events()
-                .map(|(_, event)| event)
-                .filter(|event| {
-                    let declared = &schema.events[event.event];
-                    match declared.role {
-                        Role::Message => declared.name == name,
-                        Role::Request(id) | Role::Reply(id) => schema.function(id).name == name,
-                    }
-                })
-                .collect();
-            matched.sort_by_key(|event| matches!(schema.events[event.event].role, Role::Reply(_)));
-            let sizes: Vec<String> = matched.iter().map(|event| event_size(&schema, &laid, event)).collect();
+            let sizes: Vec<String> =
+                messages(&schema, &laid, name).iter().map(|event| event_size(&schema, &laid, event)).collect();
             sizes.join("\n\n")
         }
-        Context::Declaration { name, .. } | Context::Type(name) => declared_text(&schema, name)?,
-        Context::Field { owner, name } => {
-            let field = fields(&schema, owner)?.iter().find(|field| field.name == name)?;
-            format!("`{name}`: {}", describe(&schema, field.ty))
-        }
+        Context::Declaration { name, .. } => declared_text(&schema, name)?,
+        Context::Type(name) => match declared_text(&schema, name) {
+            Some(text) => text,
+            None => field_text(&schema, &tokens, field_of_type(&tokens, index)?)?,
+        },
+        Context::Field { .. } => field_text(&schema, &tokens, index)?,
     };
     let (_, start) = tokens[index];
     Some(Hover {
@@ -469,21 +506,261 @@ pub fn definition_unit(
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
-pub fn completions(text: &str) -> Vec<CompletionItem> {
-    completions_unit(&[("", text)])
+fn name_at(text: &str, tokens: &[(Token, Span)], at: Position) -> Option<usize> {
+    let span = span_at(text, at);
+    tokens.iter().position(|(token, start)| {
+        matches!(token, Token::Name(_))
+            && start.line == span.line
+            && start.column <= span.column
+            && span.column <= start.column + width(token)
+    })
 }
 
-pub fn completions_unit(files: &[(&str, &str)]) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = BASE_TYPES
+fn type_end(tokens: &[(Token, Span)], start: usize) -> usize {
+    let mut depth = 0;
+    let mut last = start;
+    for (index, (token, _)) in tokens.iter().enumerate().skip(start) {
+        match token {
+            Token::Symbol("(" | "[") => depth += 1,
+            Token::Symbol(")" | "]") if depth > 0 => depth -= 1,
+            Token::Symbol("," | "}" | ")") | Token::End => break,
+            _ => {}
+        }
+        last = index;
+    }
+    last
+}
+
+fn cost(schema: &Schema, ty: TypeId) -> String {
+    if matches!(schema.ty(ty), Type::Instance { .. } | Type::Handle) {
+        return "an Instance beside the frame".to_string();
+    }
+    match measure(schema, ty) {
+        Ok(measured) if measured.variable => format!("{}+ bits", measured.min_bits),
+        Ok(measured) => plural(measured.min_bits),
+        Err(_) => "does not lay out".to_string(),
+    }
+}
+
+fn message_bits(laid: &Layout, event: &EventLayout) -> String {
+    let total = laid.node(event.node).min_bits + if event.aligned { event.code_bits } else { 0 };
+    if varies(laid, event.node) { format!("{total}+ bits") } else { plural(total) }
+}
+
+pub fn inlay_hints(files: &[(&str, &str)], current: usize) -> Vec<InlayHint> {
+    let Some((_, text)) = files.get(current) else { return Vec::new() };
+    let (Ok(tokens), Ok(schema)) = (tokenize(text), parse_unit(files)) else { return Vec::new() };
+    let Ok(laid) = layout(&schema) else { return Vec::new() };
+    let mut hints = Vec::new();
+    for index in 0..tokens.len() {
+        let (label, end) = match context(&tokens, index) {
+            Some(Context::Field { .. }) => {
+                let Some(ty) = field_ty(&schema, &tokens, index) else { continue };
+                (cost(&schema, ty), type_end(&tokens, index + 2))
+            }
+            Some(Context::Declaration { keyword: "event" | "function", name }) => {
+                let sizes: Vec<String> =
+                    messages(&schema, &laid, name).iter().map(|event| message_bits(&laid, event)).collect();
+                (sizes.join(", reply "), index)
+            }
+            _ => continue,
+        };
+        let (token, span) = tokens[end];
+        hints.push(InlayHint {
+            position: position(text, Span { column: span.column + width(&token), ..span }),
+            label: InlayHintLabel::String(label),
+            kind: None,
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: Some(true),
+            data: None,
+        });
+    }
+    hints
+}
+
+fn occurrences(files: &[(&str, &str)], name: &str) -> Vec<(usize, Span)> {
+    let mut found = Vec::new();
+    for (file, tokens) in unit_tokens(files).iter().enumerate() {
+        for (index, (token, span)) in tokens.iter().enumerate() {
+            if *token != Token::Name(name) {
+                continue;
+            }
+            let declared = index > 0 && matches!(tokens[index - 1].0, Token::Name(word) if DECLARING.contains(&word));
+            let field = tokens.get(index + 1).is_some_and(|(next, _)| *next == Token::Symbol(":"));
+            if declared || (!field && field_of_type(tokens, index).is_some()) {
+                found.push((file, *span));
+            }
+        }
+    }
+    found
+}
+
+fn targets<'s>(files: &[(&str, &'s str)], current: usize, at: Position) -> Option<(&'s str, Vec<(usize, Span)>)> {
+    let (_, text) = files.get(current)?;
+    let tokens = tokenize_file(text, current as u32).ok()?;
+    let index = name_at(text, &tokens, at)?;
+    let (Token::Name(name), span) = tokens[index] else { return None };
+    if tokens.get(index + 1).is_some_and(|(next, _)| *next == Token::Symbol(":")) {
+        return Some((name, vec![(current, span)]));
+    }
+    let found = occurrences(files, name);
+    found.contains(&(current, span)).then_some((name, found))
+}
+
+pub fn references_unit(files: &[(&str, &str)], uris: &[Uri], current: usize, at: Position) -> Vec<Location> {
+    let Some((name, found)) = targets(files, current, at) else { return Vec::new() };
+    found
+        .into_iter()
+        .filter_map(|(file, span)| {
+            Some(Location { uri: uris.get(file)?.clone(), range: range(files[file].1, span, name.len() as u32) })
+        })
+        .collect()
+}
+
+fn replaced(text: &str, spans: &[Span], length: usize, with: &str) -> String {
+    let starts: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(index, _)| index + 1)).collect();
+    let mut offsets: Vec<usize> = spans
         .iter()
-        .map(|(label, snippet)| CompletionItem {
-            label: (*label).to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            insert_text: Some((*snippet).to_string()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
-            ..CompletionItem::default()
+        .filter_map(|span| starts.get(span.line as usize - 1).map(|start| start + span.column as usize - 1))
+        .collect();
+    offsets.sort_unstable();
+    let mut out = text.to_string();
+    for offset in offsets.into_iter().rev() {
+        out.replace_range(offset..offset + length, with);
+    }
+    out
+}
+
+pub fn rename_unit(
+    files: &[(&str, &str)],
+    uris: &[Uri],
+    current: usize,
+    at: Position,
+    to: &str,
+) -> Result<WorkspaceEdit, String> {
+    let refused = "only a field or an enum, struct, union, event or function of this folder can be renamed";
+    let (name, found) = targets(files, current, at).ok_or(refused)?;
+    let field = found.len() == 1 && found[0].0 == current;
+    let declared =
+        unit_tokens(files).iter().any(|tokens| declarations(tokens).iter().any(|(_, found, _)| *found == name));
+    if !declared && !field {
+        return Err(refused.to_string());
+    }
+    let valid = to.bytes().next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && to.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid {
+        return Err(format!("\"{to}\" is not a name; use letters, digits and _, starting with a letter"));
+    }
+    let edited: Vec<(&str, String)> = files
+        .iter()
+        .enumerate()
+        .map(|(file, (title, text))| {
+            let spans: Vec<Span> = found.iter().filter(|(at, _)| *at == file).map(|(_, span)| *span).collect();
+            (*title, replaced(text, &spans, name.len(), to))
         })
         .collect();
+    let pairs: Vec<(&str, &str)> = edited.iter().map(|(title, text)| (*title, text.as_str())).collect();
+    if parse_unit(files).is_ok()
+        && let Err(problem) = parse_unit(&pairs)
+    {
+        let problem = match problem {
+            courier_compiler::Error::Schema(_, problem) => problem.to_string(),
+            other => other.to_string(),
+        };
+        return Err(format!("renaming \"{name}\" to \"{to}\" would break the schema: {problem}"));
+    }
+    let mut documents: Vec<TextDocumentEdit> = Vec::new();
+    for (file, uri) in uris.iter().enumerate().take(files.len()) {
+        let edits: Vec<OneOf<TextEdit, AnnotatedTextEdit>> = found
+            .iter()
+            .filter(|(at, _)| *at == file)
+            .map(|(_, span)| {
+                let range = range(files[file].1, *span, name.len() as u32);
+                OneOf::Left(TextEdit { range, new_text: to.to_string() })
+            })
+            .collect();
+        if !edits.is_empty() {
+            let text_document = OptionalVersionedTextDocumentIdentifier { uri: uri.clone(), version: None };
+            documents.push(TextDocumentEdit { text_document, edits });
+        }
+    }
+    Ok(WorkspaceEdit { document_changes: Some(DocumentChanges::Edits(documents)), ..WorkspaceEdit::default() })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Slot {
+    TopLevel,
+    From,
+    Side,
+    Unreliable,
+    Type,
+    Nothing,
+}
+
+fn slot(tokens: &[(Token, Span)], cursor: Span) -> Slot {
+    let ends = |(token, span): &(Token, Span)| (span.line, span.column + width(token));
+    let mut before: Vec<(Token, Span)> = tokens
+        .iter()
+        .filter(|entry| entry.0 != Token::End && ends(entry) <= (cursor.line, cursor.column))
+        .copied()
+        .collect();
+    if before
+        .last()
+        .is_some_and(|entry| matches!(entry.0, Token::Name(_)) && ends(entry) == (cursor.line, cursor.column))
+    {
+        before.pop();
+    }
+    let depth = before.iter().fold(0i32, |depth, (token, _)| match token {
+        Token::Symbol("{") => depth + 1,
+        Token::Symbol("}") => depth - 1,
+        _ => depth,
+    });
+    let back = |steps: usize| before.len().checked_sub(steps).map(|index| before[index].0);
+    let open = before.iter().rposition(|(token, _)| *token == Token::Symbol("("));
+    let closed = before.iter().rposition(|(token, _)| *token == Token::Symbol(")"));
+    let in_map = open.is_some_and(|open| {
+        closed.is_none_or(|closed| closed < open) && open > 0 && before[open - 1].0 == Token::Name("map")
+    });
+    match (back(2), back(1)) {
+        (_, None) => Slot::TopLevel,
+        (_, Some(Token::Symbol("}"))) if depth <= 0 => Slot::TopLevel,
+        (Some(Token::Name("event" | "function")), Some(Token::Name(_))) => Slot::From,
+        (_, Some(Token::Name("from"))) => Slot::Side,
+        (Some(Token::Name("from")), Some(Token::Name("Server" | "Client")))
+            if back(4) == Some(Token::Name("event")) =>
+        {
+            Slot::Unreliable
+        }
+        (_, Some(Token::Symbol(":"))) if depth > 0 => Slot::Type,
+        (_, Some(Token::Symbol("(" | ","))) if in_map => Slot::Type,
+        _ => Slot::Nothing,
+    }
+}
+
+fn snippet(label: &str, kind: CompletionItemKind, text: &str, detail: Option<String>) -> CompletionItem {
+    CompletionItem {
+        label: label.to_string(),
+        kind: Some(kind),
+        detail,
+        insert_text: Some(text.to_string()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        ..CompletionItem::default()
+    }
+}
+
+fn keyword_items() -> Vec<CompletionItem> {
+    STARTS
+        .iter()
+        .map(|(label, text, detail)| snippet(label, CompletionItemKind::KEYWORD, text, Some(detail.to_string())))
+        .collect()
+}
+
+fn type_items(files: &[(&str, &str)]) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> =
+        BASE_TYPES.iter().map(|(label, text)| snippet(label, CompletionItemKind::KEYWORD, text, None)).collect();
+    let schema = parse_unit(files).ok();
     for tokens in unit_tokens(files) {
         for (keyword, name, _) in declarations(&tokens) {
             let kind = match keyword {
@@ -492,10 +769,39 @@ pub fn completions_unit(files: &[(&str, &str)]) -> Vec<CompletionItem> {
                 "union" => CompletionItemKind::ENUM,
                 _ => continue,
             };
-            items.push(CompletionItem { label: name.to_string(), kind: Some(kind), ..CompletionItem::default() });
+            let detail = schema.as_ref().and_then(|schema| declared_text(schema, name)).and_then(|text| {
+                let first = text.lines().next()?;
+                Some(format!("{keyword}: {}", first.split_once(": ").map_or(first, |(_, size)| size)))
+            });
+            items.push(CompletionItem {
+                label: name.to_string(),
+                kind: Some(kind),
+                detail,
+                ..CompletionItem::default()
+            });
         }
     }
     items
+}
+
+pub fn completions(text: &str) -> Vec<CompletionItem> {
+    let mut items = type_items(&[("", text)]);
+    items.extend(keyword_items());
+    items
+}
+
+pub fn completions_unit(files: &[(&str, &str)], current: usize, at: Position) -> Vec<CompletionItem> {
+    let Some((_, text)) = files.get(current) else { return Vec::new() };
+    let Ok(tokens) = tokenize(text) else { return Vec::new() };
+    let word = |label: &str, detail: &str| snippet(label, CompletionItemKind::KEYWORD, label, Some(detail.to_string()));
+    match slot(&tokens, span_at(text, at)) {
+        Slot::TopLevel => keyword_items(),
+        Slot::From => vec![word("from", "who sends it")],
+        Slot::Side => vec![word("Client", "a client sends it to the server"), word("Server", "the server sends it")],
+        Slot::Unreliable => vec![word("unreliable", "may be lost or arrive out of order; cannot carry Instances")],
+        Slot::Type => type_items(files),
+        Slot::Nothing => Vec::new(),
+    }
 }
 
 #[allow(deprecated)]
@@ -541,5 +847,68 @@ mod tests {
         let found = diagnose_unit(&files);
         assert!(found[0].is_empty());
         assert_eq!(found[1][0].range.start, Position { line: 0, character: 5 });
+    }
+
+    fn at(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|item| item.label.as_str()).collect()
+    }
+
+    #[test]
+    fn hints_give_each_field_and_message_its_bits() {
+        let files = [("A.courier", "event Hit from Server { Damage: int(0..100), Tags: u8[..4] }")];
+        let hints: Vec<(Position, String)> = inlay_hints(&files, 0)
+            .into_iter()
+            .map(|hint| match hint.label {
+                InlayHintLabel::String(label) => (hint.position, label),
+                InlayHintLabel::LabelParts(_) => panic!("a plain label"),
+            })
+            .collect();
+        assert_eq!(hints[0].1, "10+ bits");
+        assert_eq!(hints[1], (at(0, 43), "7 bits".to_string()));
+        assert_eq!(hints[2], (at(0, 58), "3+ bits".to_string()));
+    }
+
+    #[test]
+    fn completion_offers_what_fits_where_the_cursor_is() {
+        let complete = |text: &str, character: u32| completions_unit(&[("A.courier", text)], 0, at(0, character));
+        assert!(labels(&complete("", 0)).contains(&"event"));
+        assert!(labels(&complete("event Hit ", 10)).contains(&"from"));
+        assert_eq!(labels(&complete("event Hit from ", 15)), ["Client", "Server"]);
+        assert_eq!(labels(&complete("event Hit from Se", 17)), ["Client", "Server"]);
+        assert_eq!(labels(&complete("event Hit from Server ", 22)), ["unreliable"]);
+        assert!(labels(&complete("event Hit from Server { A: ", 27)).contains(&"bool"));
+        assert!(labels(&complete("event Hit from Server { A: map(", 31)).contains(&"string"));
+        assert!(complete("event Hit from Server { ", 24).is_empty());
+        assert!(labels(&complete("enum E { A, B } ", 16)).contains(&"struct"));
+    }
+
+    #[test]
+    fn a_built_in_type_hovers_as_its_field() {
+        let hovered = hover_unit(&[("A.courier", "event Hit from Server { Damage: u8 }")], 0, at(0, 33));
+        let Some(Hover { contents: HoverContents::Markup(shown), .. }) = hovered else { panic!("a hover") };
+        assert_eq!(shown.value, "`Damage`: 8 bits");
+    }
+
+    #[test]
+    fn renaming_a_type_follows_it_across_files() {
+        let files = [
+            ("A.courier", "event Hit from Server { W: Weapon, L: Weapon[..2] }"),
+            ("B.courier", "enum Weapon { Sword, Bow }\nunion U { Weapon, Other { Weapon: u8 } }"),
+        ];
+        let uris: Vec<Uri> = ["file:///a.courier", "file:///b.courier"].map(|uri| uri.parse().expect("a uri")).to_vec();
+        assert_eq!(references_unit(&files, &uris, 1, at(0, 6)).len(), 3);
+        let counts = |edit: WorkspaceEdit| match edit.document_changes {
+            Some(DocumentChanges::Edits(documents)) => documents.iter().map(|document| document.edits.len()).collect(),
+            _ => Vec::new(),
+        };
+        assert_eq!(counts(rename_unit(&files, &uris, 0, at(0, 28), "Arm").expect("a valid rename")), [2, 1]);
+        assert!(rename_unit(&files, &uris, 0, at(0, 28), "Hit").is_err());
+        assert!(rename_unit(&files, &uris, 0, at(0, 28), "1x").is_err());
+        assert_eq!(counts(rename_unit(&files, &uris, 0, at(0, 24), "Main").expect("a field rename")), [1]);
+        assert!(rename_unit(&files, &uris, 1, at(0, 16), "X").is_err());
     }
 }

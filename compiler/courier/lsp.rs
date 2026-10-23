@@ -1,17 +1,24 @@
 //! `courier lsp`, the language server the VS Code extension runs. Each file is read with the
 //! other schemas of its folder, open ones as the editor holds them, and errors are published to
-//! whichever file of the folder they are in.
+//! whichever file of the folder they are in. Saving a schema compiles its folder, as `courier`
+//! would, unless the editor turned that off.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use courier_editor::{completions_unit, definition_unit, diagnose_unit, hover_unit, symbols};
-use lsp_server::{Connection, Message, Notification, Request, Response};
-use lsp_types::{
-    CompletionOptions, DocumentSymbolResponse, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+use courier_compiler::codegen::Mode;
+use courier_editor::{
+    completions_unit, definition_unit, diagnose_unit, hover_unit, inlay_hints, references_unit, rename_unit, symbols,
 };
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
+use lsp_types::{
+    CompletionOptions, DocumentSymbolResponse, HoverProviderCapability, LogMessageParams, MessageType, OneOf,
+    PublishDiagnosticsParams, SaveOptions, ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
+};
+
+use crate::{Command, Error as Build, compile, schemas_in};
 
 type Documents = HashMap<String, String>;
 
@@ -30,9 +37,17 @@ impl Unit {
 pub fn serve() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (connection, threads) = Connection::stdio();
     let capabilities = ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+            open_close: Some(true),
+            change: Some(TextDocumentSyncKind::FULL),
+            save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions { include_text: Some(false) })),
+            ..TextDocumentSyncOptions::default()
+        })),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![":".into(), "(".into(), ",".into()]),
@@ -40,7 +55,9 @@ pub fn serve() -> Result<(), Box<dyn Error + Send + Sync>> {
         }),
         ..ServerCapabilities::default()
     };
-    connection.initialize(serde_json::to_value(capabilities)?)?;
+    let started = connection.initialize(serde_json::to_value(capabilities)?)?;
+    let compile_on_save =
+        started.pointer("/initializationOptions/compileOnSave").and_then(serde_json::Value::as_bool).unwrap_or(true);
     let mut documents = Documents::new();
     for message in &connection.receiver {
         match message {
@@ -51,6 +68,13 @@ pub fn serve() -> Result<(), Box<dyn Error + Send + Sync>> {
                 connection.sender.send(Message::Response(answer(&documents, request)))?;
             }
             Message::Notification(notification) => {
+                if notification.method == "textDocument/didSave" && compile_on_save {
+                    let saved: Option<lsp_types::DidSaveTextDocumentParams> =
+                        serde_json::from_value(notification.params.clone()).ok();
+                    if let Some(said) = saved.and_then(|saved| build(saved.text_document.uri.as_str())) {
+                        connection.sender.send(Message::Notification(said))?;
+                    }
+                }
                 let Some(uri) = update(&mut documents, notification) else { continue };
                 let unit = unit(&documents, &uri);
                 for (diagnostics, uri) in diagnose_unit(&unit.files()).into_iter().zip(unit.uris) {
@@ -64,6 +88,29 @@ pub fn serve() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     drop(threads);
     Ok(())
+}
+
+fn build(uri: &str) -> Option<Notification> {
+    let folder = path_of(uri)?.parent()?.to_path_buf();
+    let schemas = schemas_in(&folder);
+    if schemas.is_empty() {
+        return None;
+    }
+    let command = Command { mode: Mode::Api, runtime: None, input: None, output: None, watch: false };
+    let (method, params) = match compile(&command, &schemas, &folder) {
+        Ok(()) => {
+            let message = format!("compiled {} into {}", crate::names(&schemas), folder.display());
+            ("window/logMessage", serde_json::to_value(LogMessageParams { typ: MessageType::INFO, message }).ok()?)
+        }
+        Err(Build::Schema { .. } | Build::Compile { problem: courier_compiler::Error::Layout { .. }, .. }) => {
+            return None;
+        }
+        Err(problem) => {
+            let message = format!("Courier: {problem}");
+            ("window/showMessage", serde_json::to_value(ShowMessageParams { typ: MessageType::WARNING, message }).ok()?)
+        }
+    };
+    Some(Notification::new(method.into(), params))
 }
 
 fn decode(text: &str) -> String {
@@ -189,9 +236,34 @@ fn answer(documents: &Documents, request: Request) -> Response {
         }
         "textDocument/completion" => {
             serde_json::from_value::<lsp_types::CompletionParams>(params).ok().and_then(|params| {
-                let unit = unit(documents, &params.text_document_position.text_document.uri);
-                serde_json::to_value(completions_unit(&unit.files())).ok()
+                let place = params.text_document_position;
+                let unit = unit(documents, &place.text_document.uri);
+                serde_json::to_value(completions_unit(&unit.files(), unit.current, place.position)).ok()
             })
+        }
+        "textDocument/inlayHint" => {
+            serde_json::from_value::<lsp_types::InlayHintParams>(params).ok().and_then(|params| {
+                let unit = unit(documents, &params.text_document.uri);
+                serde_json::to_value(inlay_hints(&unit.files(), unit.current)).ok()
+            })
+        }
+        "textDocument/references" => {
+            serde_json::from_value::<lsp_types::ReferenceParams>(params).ok().and_then(|params| {
+                let place = params.text_document_position;
+                let unit = unit(documents, &place.text_document.uri);
+                serde_json::to_value(references_unit(&unit.files(), &unit.uris, unit.current, place.position)).ok()
+            })
+        }
+        "textDocument/rename" => {
+            let Ok(params) = serde_json::from_value::<lsp_types::RenameParams>(params) else {
+                return Response::new_err(id, ErrorCode::InvalidParams as i32, "bad rename request".into());
+            };
+            let place = params.text_document_position;
+            let unit = unit(documents, &place.text_document.uri);
+            match rename_unit(&unit.files(), &unit.uris, unit.current, place.position, &params.new_name) {
+                Ok(edit) => serde_json::to_value(edit).ok(),
+                Err(problem) => return Response::new_err(id, ErrorCode::InvalidRequest as i32, problem),
+            }
         }
         "textDocument/documentSymbol" => {
             serde_json::from_value::<lsp_types::DocumentSymbolParams>(params).ok().and_then(|params| {

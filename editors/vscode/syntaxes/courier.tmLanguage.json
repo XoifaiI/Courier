@@ -3,7 +3,6 @@
 	"scopeName": "source.courier",
 	"patterns": [
 		{ "include": "#comment" },
-		{ "include": "#option" },
 		{ "include": "#declaration" },
 		{ "include": "#field" },
 		{ "include": "#type" },
@@ -17,13 +16,6 @@
 		"comment": {
 			"name": "comment.line.double-dash.courier",
 			"match": "--.*$"
-		},
-		"option": {
-			"match": "\\b(option)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-			"captures": {
-				"1": { "name": "keyword.other.option.courier" },
-				"2": { "name": "variable.other.option.courier" }
-			}
 		},
 		"declaration": {
 			"match": "\\b(enum|struct|union|event|function)\\s+([A-Za-z_][A-Za-z0-9_]*)",

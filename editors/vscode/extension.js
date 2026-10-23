@@ -1,7 +1,8 @@
 /*
 	Courier for VS Code: starts `courier lsp`, the compiler's own language server, for every .courier
-	file, so errors, hover sizes, definitions, completion and the outline come from the compiler
-	that builds the game. The binary is the courier.path setting, `courier` on PATH by default, as
+	file, so errors, sizes on hover and inline, definitions, references, renames, completion and the
+	outline come from the compiler that builds the game. Saving a schema compiles its folder unless
+	courier.compileOnSave is off, which the server reads when it starts. The binary is the courier.path setting, `courier` on PATH by default, as
 	Rokit installs it. If it cannot start, the extension says so and highlighting still works
 
 	When courier.path names a file, the server runs from a copy in the extension's storage, so the
@@ -58,7 +59,12 @@ async function start() {
 		"courier",
 		"Courier",
 		{ command: run, args: ["lsp"] },
-		{ documentSelector: [{ scheme: "file", language: "courier" }] }
+		{
+			documentSelector: [{ scheme: "file", language: "courier" }],
+			initializationOptions: {
+				compileOnSave: vscode.workspace.getConfiguration("courier").get("compileOnSave", true),
+			},
+		}
 	);
 	try {
 		await client.start();
@@ -104,7 +110,7 @@ async function activate(context) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand("courier.restart", () => restart()),
 		vscode.workspace.onDidChangeConfiguration((change) => {
-			if (change.affectsConfiguration("courier.path")) {
+			if (change.affectsConfiguration("courier.path") || change.affectsConfiguration("courier.compileOnSave")) {
 				restart();
 			}
 		})
