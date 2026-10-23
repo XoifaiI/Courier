@@ -1,6 +1,6 @@
 # Courier for VS Code
 
-Language support for [Courier](https://github.com/XoifaiI/Courier) schemas, the `.courier` files
+Language support for [Courier](https://github.com/xoifaii/Courier) schemas, the `.courier` files
 the Courier compiler turns into bit packed, strictly typed Roblox networking.
 
 ## Features
@@ -22,8 +22,11 @@ the Courier compiler turns into bit packed, strictly typed Roblox networking.
 The extension runs the `courier` compiler. Install it with [Rokit](https://github.com/rojo-rbx/rokit):
 
 ```sh
-rokit add XoifaiI/Courier
+rokit add xoifaii/Courier
 ```
+
+The compiler carries this extension too: `courier vscode` installs it into VS Code, Cursor and
+Windsurf.
 
 ## Settings
 

@@ -4,6 +4,7 @@
 //! courier                  compile every folder of schemas here into itself
 //! courier watch            the same, again whenever a schema changes, appears or goes
 //! courier lsp              language server for the editor
+//! courier vscode           install the editor extension into VS Code, Cursor and the like
 //! courier [--codec] [--runtime <path>] <schema or folder> [<output>]
 //! ```
 
@@ -27,10 +28,33 @@ const RUNTIME: [(&str, &str); 4] = [
 
 const FRONT: &str = "require(\"@self/Implementation\")";
 
+#[cfg(vsix)]
+const EXTENSION: Option<&[u8]> = Some(include_bytes!(env!("COURIER_VSIX")));
+#[cfg(not(vsix))]
+const EXTENSION: Option<&[u8]> = None;
+
+const EDITORS: [(&str, &str); 4] =
+    [("code", "VS Code"), ("code-insiders", "VS Code Insiders"), ("cursor", "Cursor"), ("windsurf", "Windsurf")];
+
+const MAC_EDITORS: [(&str, &str); 4] = [
+    ("code", "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+    ("code-insiders", "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code"),
+    ("cursor", "/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
+    ("windsurf", "/Applications/Windsurf.app/Contents/Resources/app/bin/windsurf"),
+];
+
 #[derive(Debug, thiserror::Error)]
 enum Error {
-    #[error("usage: courier [watch] | courier [--codec] [--runtime <path>] <schema or folder> [<output>]")]
+    #[error("usage: courier [watch | vscode] | courier [--codec] [--runtime <path>] <schema or folder> [<output>]")]
     Usage,
+    #[error(
+        "this courier was built without the editor extension; run `npm run package` in editors/vscode, then build again"
+    )]
+    NoExtension,
+    #[error(
+        "found no VS Code, Cursor or Windsurf command line; in VS Code, run \"Shell Command: Install 'code' command in PATH\" from the command palette, then try again"
+    )]
+    NoEditor,
     #[error("could not read {path}: {source}")]
     Read { path: PathBuf, source: std::io::Error },
     #[error("{schema}:{problem}\n{excerpt}")]
@@ -282,7 +306,58 @@ fn watch(command: &Command) -> Result<ExitCode, Error> {
     }
 }
 
+fn editor(name: &str) -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) { &["cmd", "exe"] } else { &[""] };
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|folder| {
+            names
+                .iter()
+                .map(|extension| folder.join(name).with_extension(extension))
+                .find(|candidate| candidate.is_file())
+        })
+    });
+    if found.is_some() || !cfg!(target_os = "macos") {
+        return found;
+    }
+    MAC_EDITORS
+        .iter()
+        .find(|(command, _)| *command == name)
+        .map(|(_, path)| PathBuf::from(path))
+        .filter(|path| path.is_file())
+}
+
+fn install_extension() -> Result<ExitCode, Error> {
+    let extension = EXTENSION.ok_or(Error::NoExtension)?;
+    let editors: Vec<(PathBuf, &str)> =
+        EDITORS.iter().filter_map(|(name, label)| editor(name).map(|path| (path, *label))).collect();
+    if editors.is_empty() {
+        return Err(Error::NoEditor);
+    }
+    let vsix = std::env::temp_dir().join(format!("courier-{}.vsix", env!("CARGO_PKG_VERSION")));
+    std::fs::write(&vsix, extension).map_err(|source| Error::Write { path: vsix.clone(), source })?;
+    let mut failed = false;
+    for (path, label) in editors {
+        let output = std::process::Command::new(&path).arg("--install-extension").arg(&vsix).arg("--force").output();
+        match output {
+            Ok(output) if output.status.success() => println!("installed the Courier extension in {label}"),
+            Ok(output) => {
+                failed = true;
+                eprintln!("{label} could not install it: {}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+            Err(problem) => {
+                failed = true;
+                eprintln!("could not run {}: {problem}", path.display());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&vsix);
+    Ok(if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
 fn run() -> Result<ExitCode, Error> {
+    if std::env::args().nth(1).as_deref() == Some("vscode") {
+        return if std::env::args().len() == 2 { install_extension() } else { Err(Error::Usage) };
+    }
     if std::env::args().nth(1).as_deref() == Some("lsp") {
         return Ok(match lsp::serve() {
             Ok(()) => ExitCode::SUCCESS,

@@ -50,7 +50,7 @@ Net.Damaged.FireAll(10, 90)
 `Shoot` is 37 bits, id included. `Damaged` is 16. The part costs nothing, it goes alongside.
 
 Clients can send anything, so every value is checked as it's read. If one is wrong, the whole
-frame is dropped and your handler never sees it.
+frame is yeeted and your handler never sees it.
 
 ## Features
 
@@ -62,7 +62,7 @@ frame is dropped and your handler never sees it.
 - **Functions** | `Invoke` returns a Future
 - **Instances** | wait on parts that haven't streamed in yet
 - **Middleware** | typed per event, or on every event at once
-- **Editor support** | hover an event to see its size, errors as you type
+- **Editor support** | hover an event to see its size, errors as you type; `courier vscode` installs it
 - **Watch mode** | recompiles when you save
 
 ## Benchmarks

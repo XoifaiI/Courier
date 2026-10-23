@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   compiler:
+    needs: extension
     strategy:
       matrix:
         include:
@@ -22,6 +23,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: courier-vscode
+          path: editors/vscode
       - name: Build
         working-directory: compiler
         run: cargo build --release --locked -p courier --target ${{ matrix.target }}
@@ -52,7 +57,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: courier-vscode
-          path: editors/vscode/*.vsix
+          path: editors/vscode/courier.vsix
 
   wally:
     runs-on: ubuntu-latest

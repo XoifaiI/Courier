@@ -2,6 +2,7 @@
 name = "courier"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "courier"

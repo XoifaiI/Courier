@@ -1,17 +1,22 @@
 {
-	"name": "courier",
-	"displayName": "Courier",
+	"name": "courier-roblox",
+	"displayName": "Courier for Roblox",
 	"description": "Courier schemas for Roblox: live errors, bit sizes inline and on hover, rename, references, completion, and compile on save",
 	"version": "0.2.0",
 	"publisher": "xoifaii",
 	"license": "MIT",
+	"icon": "icon.png",
+	"galleryBanner": {
+		"color": "#12151B",
+		"theme": "dark"
+	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/XoifaiI/Courier"
+		"url": "https://github.com/xoifaii/Courier"
 	},
-	"homepage": "https://github.com/XoifaiI/Courier#readme",
+	"homepage": "https://github.com/xoifaii/Courier#readme",
 	"bugs": {
-		"url": "https://github.com/XoifaiI/Courier/issues"
+		"url": "https://github.com/xoifaii/Courier/issues"
 	},
 	"private": true,
 	"engines": {
@@ -68,7 +73,7 @@
 	},
 	"scripts": {
 		"bundle": "esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
-		"package": "npm run bundle && vsce package --no-dependencies"
+		"package": "npm run bundle && vsce package --no-dependencies -o courier.vsix"
 	},
 	"dependencies": {
 		"vscode-languageclient": "^9.0.1"

@@ -3,5 +3,6 @@
 !dist/extension.js
 !language-configuration.json
 !syntaxes/**
+!icon.png
 !README.md
 !LICENSE
