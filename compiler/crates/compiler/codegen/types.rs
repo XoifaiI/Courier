@@ -90,19 +90,24 @@ pub fn handler_type(schema: &Schema, event: &Event, mode: Mode) -> Option<String
     }
 }
 
-pub fn payload_type(schema: &Schema, event: &Event) -> String {
-    let fields = match event.role {
+pub fn arguments<'e, 's>(event: &'e Event<'s>) -> &'e [Field<'s>] {
+    match event.role {
         Role::Request(_) => &event.fields[1..],
         Role::Message | Role::Reply(_) => &event.fields[..],
-    };
-    let mut types: Vec<String> = Vec::new();
-    for field in fields {
-        let ty = luau_type(schema, field.ty, false);
-        if !types.contains(&ty) {
-            types.push(ty);
-        }
     }
-    if types.is_empty() { "{ never }".to_string() } else { format!("{{ {} }}", types.join(" | ")) }
+}
+
+pub fn call_type(schema: &Schema, event: &Event) -> String {
+    let fields: Vec<String> = arguments(event)
+        .iter()
+        .map(|field| format!("{}: {}", field.name, luau_type(schema, field.ty, false)))
+        .collect();
+    let args = if fields.is_empty() { "{}".to_string() } else { format!("{{ {} }}", fields.join(", ")) };
+    let player = if event.from == Side::Client { "Player" } else { "nil" };
+    format!(
+        "{{ read Name: \"{}\", read Player: {player}, Args: {args}, read Shared: {{ [unknown]: unknown }}, read Reject: (self: unknown, Reason: string) -> () }}",
+        event.name
+    )
 }
 
 pub fn screaming(text: &str) -> String {
@@ -131,14 +136,17 @@ mod tests {
     }
 
     #[test]
-    fn payloads_list_each_field_type_once() {
+    fn calls_name_their_event_sender_and_arguments() {
         let schema = crate::schema::parse(
-            "event Move from Client { X: u8, Y: u8, Name: string(..8) }
-event Ping from Client {}",
+            "event Move from Client { X: u8, Part: Instance(BasePart) }
+event Ping from Server {}
+function Buy from Client { Item: u16 } -> { Ok: bool }",
         )
         .expect("the schema parses");
-        assert_eq!(payload_type(&schema, &schema.events[0]), "{ number | string }");
-        assert_eq!(payload_type(&schema, &schema.events[1]), "{ never }");
+        let call = call_type(&schema, &schema.events[0]);
+        assert!(call.starts_with("{ read Name: \"Move\", read Player: Player, Args: { X: number, Part: BasePart? }"));
+        assert!(call_type(&schema, &schema.events[1]).contains("read Player: nil, Args: {},"));
+        assert!(call_type(&schema, &schema.events[2]).contains("Args: { Item: number }"));
     }
 
     #[test]

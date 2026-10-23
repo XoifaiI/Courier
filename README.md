@@ -61,7 +61,7 @@ frame is dropped and your handler never sees it.
 - **Fast** | generated for `--!native`
 - **Functions** | `Invoke` returns a Future
 - **Instances** | wait on parts that haven't streamed in yet
-- **Middleware** | per event, rate limiter included
+- **Middleware** | typed per event, or on every event at once
 - **Editor support** | hover an event to see its size, errors as you type
 - **Watch mode** | recompiles when you save
 

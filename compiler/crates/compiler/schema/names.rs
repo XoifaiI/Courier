@@ -5,10 +5,14 @@ pub const KEYWORDS: [&str; 21] = [
     "repeat", "return", "then", "true", "until", "while",
 ];
 
-pub const RESERVED_TYPES: [&str; 23] = [
+pub const RESERVED_TYPES: [&str; 27] = [
     "Stream",
     "Future",
     "Middleware",
+    "AddMiddleware",
+    "Call",
+    "Calls",
+    "PickCall",
     "ServerHandlers",
     "ClientHandlers",
     "number",

@@ -6,6 +6,7 @@ use super::types::{enum_table, fields_typed, parameters, screaming};
 use crate::layout::{Chunk, Codec, Count, EventLayout, Leaf, LeafKind, NodeId, PathId, Tail, bits_for, mask};
 use crate::luau::builtins::*;
 use std::cell::{Cell, RefCell};
+use std::ops::Range;
 
 use crate::luau::{BinOp, Block, ExprId, Name, Parameter, Stmt, assign, decrease, increase, local, when};
 use crate::schema::UNION_TAG;
@@ -19,6 +20,12 @@ pub const MAX_CHAIN: usize = 8;
 pub const F32_LIMIT: f64 = 340_282_356_779_733_661_637_539_395_458_142_568_448.0;
 
 const CARRY: f64 = 1.0 / 4_294_967_296.0;
+
+const SCALED: u32 = 3;
+
+pub const WIDE_LOCALS: usize = 120;
+
+pub const CHUNK_WORDS: u32 = 16;
 
 struct Locals<'a> {
     leaves: Vec<Name<'a>>,
@@ -62,6 +69,7 @@ struct Writer<'e, 'f, 'a> {
     trail: RefCell<Vec<String>>,
     aligned: Cell<bool>,
     raw_floats: Cell<bool>,
+    shared: RefCell<Vec<bool>>,
 }
 
 impl<'a> Writer<'_, '_, 'a> {
@@ -324,6 +332,10 @@ impl<'a> Writer<'_, '_, 'a> {
     }
 
     fn stores(&self, node: NodeId, locals: &Locals<'a>) -> Block<'a> {
+        self.stores_where(node, locals, &|_| true)
+    }
+
+    fn stores_where(&self, node: NodeId, locals: &Locals<'a>, include: &dyn Fn(usize) -> bool) -> Block<'a> {
         let (e, b) = (self.e, self.e.b);
         let leaves = e.layout.leaves(node);
         let axes = self.cframe_axes(node);
@@ -332,21 +344,21 @@ impl<'a> Writer<'_, '_, 'a> {
             let LeafKind::Rotation { steps, .. } = leaves[rotation].kind else {
                 panic!("a rotation starts at its first part");
             };
-            let mut names = position.to_vec();
-            names.extend_from_slice(&locals.leaves[rotation..rotation + 4]);
             let packed = b.invoke("PackCFrame", [e.read(leaves[rotation].path), b.number(steps)]);
-            Stmt::Locals(names, Some("number".into()), packed)
+            let mut targets: Vec<(Name<'a>, Option<usize>)> = position.iter().map(|name| (*name, None)).collect();
+            targets.extend((rotation..rotation + 4).map(|slot| (locals.leaves[slot], Some(slot))));
+            self.unpack(&targets, packed, locals)
         };
         let mut out = Vec::new();
         for (slot, leaf) in leaves.iter().enumerate() {
-            if matches!(leaf.kind, LeafKind::Group { .. }) {
+            if matches!(leaf.kind, LeafKind::Group { .. }) || !include(slot) {
                 continue;
             }
             let value = match axes[slot] {
                 Some((rotation, axis)) => {
                     if axis == 0 {
                         let position = [e.temp('K'), e.temp('K'), e.temp('K')];
-                        out.push(pack(rotation, position));
+                        out.extend(pack(rotation, position));
                         positions[rotation] = Some(position);
                     }
                     let position = positions[rotation].expect("a position is packed at its first axis");
@@ -369,18 +381,18 @@ impl<'a> Writer<'_, '_, 'a> {
                     }
                     Codec::Enum { id, optional: false } => self.enum_index(id, value, 0, leaf.path),
                     Codec::F32 if self.raw_floats.get() => {
-                        out.push(number(locals.leaves[slot], value));
+                        out.push(self.bind(slot, locals, value));
                         out.push(self.finite_value(b.name(locals.leaves[slot]), leaf.path));
                         continue;
                     }
                     Codec::F32 => {
-                        out.push(number(locals.leaves[slot], b.invoke("F32Bits", [value])));
+                        out.push(self.bind(slot, locals, b.invoke("F32Bits", [value])));
                         out.push(self.finite(b.name(locals.leaves[slot]), 0x7F80_0000, leaf.path));
                         continue;
                     }
                     Codec::F64 { high: false } => {
-                        let names = vec![locals.leaves[slot], locals.leaves[slot + 1]];
-                        out.push(Stmt::Locals(names, Some("number".into()), b.invoke("F64Bits", [value])));
+                        let targets = [(locals.leaves[slot], Some(slot)), (locals.leaves[slot + 1], Some(slot + 1))];
+                        out.extend(self.unpack(&targets, b.invoke("F64Bits", [value]), locals));
                         out.push(self.finite(b.name(locals.leaves[slot + 1]), 0x7FF0_0000, leaf.path));
                         continue;
                     }
@@ -391,23 +403,23 @@ impl<'a> Writer<'_, '_, 'a> {
                     b.minus(b.name(held), f64::from(min))
                 }
                 LeafKind::Rotation { part: 0, .. } if positions[slot].is_none() => {
-                    out.push(pack(slot, [Name::Fixed("_"); 3]));
+                    out.extend(pack(slot, [Name::Fixed("_"); 3]));
                     continue;
                 }
                 LeafKind::Presence | LeafKind::Tag { .. } | LeafKind::Rotation { .. } | LeafKind::Group { .. } => {
                     continue;
                 }
             };
-            out.push(number(locals.leaves[slot], stored));
+            out.push(self.bind(slot, locals, stored));
         }
-        out.extend(self.groups(node, locals));
+        out.extend(self.groups(node, locals, include));
         out
     }
 
-    fn groups(&self, node: NodeId, locals: &Locals<'a>) -> Block<'a> {
+    fn groups(&self, node: NodeId, locals: &Locals<'a>, include: &dyn Fn(usize) -> bool) -> Block<'a> {
         let (e, b) = (self.e, self.e.b);
         let mut out = Vec::new();
-        for group in e.layout.groups(node) {
+        for group in e.layout.groups(node).iter().filter(|group| include(group.low.0 as usize)) {
             let terms: Vec<ExprId> = group
                 .members
                 .iter()
@@ -420,15 +432,15 @@ impl<'a> Writer<'_, '_, 'a> {
             let packed = b.sum(terms);
             let low = group.low;
             match group.high {
-                None => out.push(number(locals.leaves[low.0 as usize], packed)),
+                None => out.push(self.bind(low.0 as usize, locals, packed)),
                 Some(high) => {
                     let held = e.temp('R');
                     out.push(number(held, packed));
                     let high_value = b.invoke(FLOOR, [b.mul(b.name(held), b.number(CARRY))]);
-                    out.push(number(locals.leaves[high.0 as usize], high_value));
+                    out.push(self.bind(high.0 as usize, locals, high_value));
                     let low_value =
                         b.sub(b.name(held), b.mul(b.name(locals.leaves[high.0 as usize]), b.number(4_294_967_296.0)));
-                    out.push(number(locals.leaves[low.0 as usize], low_value));
+                    out.push(self.bind(low.0 as usize, locals, low_value));
                 }
             }
         }
@@ -481,49 +493,220 @@ impl<'a> Writer<'_, '_, 'a> {
         parts.into_iter().map(|terms| b.sum(terms)).collect()
     }
 
+    fn wide(&self, node: NodeId) -> bool {
+        let layout = &self.e.layout;
+        let groups: usize = layout.groups(node).iter().map(|group| group.members.len() + 1).sum();
+        2 * layout.node(node).words() as usize + layout.leaves(node).len() + groups > WIDE_LOCALS
+    }
+
+    fn atoms(&self, node: NodeId) -> Vec<usize> {
+        let leaves = self.e.layout.leaves(node);
+        let mut atoms: Vec<usize> = (0..leaves.len()).collect();
+        for (slot, axis) in self.cframe_axes(node).into_iter().enumerate() {
+            if let Some((rotation, _)) = axis {
+                atoms[slot] = rotation;
+            }
+        }
+        for (slot, leaf) in leaves.iter().enumerate() {
+            match leaf.kind {
+                LeafKind::Rotation { part, .. } if part > 0 => atoms[slot] = slot - part as usize,
+                LeafKind::Value(Codec::F64 { high: true }) => atoms[slot] = slot - 1,
+                _ => {}
+            }
+        }
+        atoms
+    }
+
+    fn chunks(&self, node: NodeId) -> (Vec<Range<u32>>, Vec<usize>, Vec<bool>) {
+        let leaves = self.e.layout.leaves(node);
+        let words = self.e.layout.node(node).words();
+        if !self.wide(node) {
+            return (std::iter::once(0..words).collect(), vec![0; leaves.len()], vec![false; leaves.len()]);
+        }
+        let atoms = self.atoms(node);
+        let mut span: Vec<Option<(u32, u32)>> = vec![None; leaves.len()];
+        for (slot, leaf) in leaves.iter().enumerate().filter(|(_, leaf)| leaf.is_placed()) {
+            let (first, last) = (leaf.position / 32, (leaf.position + leaf.bits.max(1) - 1) / 32);
+            let known = span[atoms[slot]].get_or_insert((first, last));
+            *known = (known.0.min(first), known.1.max(last));
+        }
+        let mut size = vec![0; leaves.len()];
+        for slot in 0..leaves.len() {
+            size[atoms[slot]] += 1;
+        }
+        let blocked = |at: u32| {
+            span.iter()
+                .enumerate()
+                .any(|(atom, known)| size[atom] > 1 && known.is_some_and(|(first, last)| first < at && last >= at))
+        };
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        while start < words {
+            let mut end = (start + CHUNK_WORDS).min(words);
+            while end < words && blocked(end) {
+                end += 1;
+            }
+            chunks.push(start..end);
+            start = end;
+        }
+        let chunk_of = |position: u32| chunks.iter().position(|chunk| chunk.contains(&(position / 32))).unwrap_or(0);
+        let last_of = |leaf: &crate::layout::Leaf| chunk_of(leaf.position + leaf.bits.max(1) - 1);
+        let mut used = vec![0; leaves.len()];
+        for (slot, leaf) in leaves.iter().enumerate().filter(|(_, leaf)| leaf.is_placed()) {
+            used[slot] = chunk_of(leaf.position);
+        }
+        for group in self.e.layout.groups(node) {
+            let summed = chunk_of(leaves[group.low.0 as usize].position);
+            for member in &group.members {
+                used[member.0 as usize] = summed;
+            }
+            for part in std::iter::once(group.low).chain(group.high) {
+                used[part.0 as usize] = summed.min(used[part.0 as usize]);
+            }
+        }
+        let mut first = vec![usize::MAX; leaves.len()];
+        for slot in 0..leaves.len() {
+            first[atoms[slot]] = first[atoms[slot]].min(used[slot]);
+        }
+        let owner: Vec<usize> = (0..leaves.len()).map(|slot| first[atoms[slot]]).collect();
+        let mut shared: Vec<bool> = (0..leaves.len())
+            .map(|slot| owner[slot] != chunk_of(leaves[slot].position) || owner[slot] != last_of(&leaves[slot]))
+            .collect();
+        for (slot, leaf) in leaves.iter().enumerate() {
+            if !leaf.is_placed() {
+                shared[slot] = owner[slot] != used[slot];
+            }
+        }
+        for group in self.e.layout.groups(node) {
+            let summed = chunk_of(leaves[group.low.0 as usize].position);
+            for part in std::iter::once(group.low).chain(group.high) {
+                let leaf = &leaves[part.0 as usize];
+                shared[part.0 as usize] = chunk_of(leaf.position) != summed || last_of(leaf) != summed;
+            }
+        }
+        for (slot, leaf) in leaves.iter().enumerate() {
+            let bound = match leaf.kind {
+                LeafKind::Value(Codec::Bool | Codec::Enum { optional: true, .. }) => false,
+                LeafKind::Value(Codec::Enum { id, .. }) => !self.chained(id),
+                LeafKind::Value(_) | LeafKind::Count { .. } | LeafKind::Group { .. } => true,
+                LeafKind::Rotation { .. } => true,
+                LeafKind::Presence | LeafKind::Tag { .. } => false,
+            };
+            shared[slot] &= bound;
+        }
+        (chunks, owner, shared)
+    }
+
+    fn unpack(&self, targets: &[(Name<'a>, Option<usize>)], value: ExprId, locals: &Locals<'a>) -> Block<'a> {
+        let shared =
+            |slot: Option<usize>| slot.is_some_and(|slot| self.shared.borrow().get(slot).copied().unwrap_or(false));
+        let held: Vec<Name<'a>> =
+            targets.iter().map(|(name, slot)| if shared(*slot) { self.e.temp('T') } else { *name }).collect();
+        let mut out = vec![Stmt::Locals(held.clone(), Some("number".into()), value)];
+        for ((_, slot), name) in targets.iter().zip(held) {
+            if let Some(slot) = slot.filter(|slot| shared(Some(*slot))) {
+                out.push(self.bind(slot, locals, self.e.b.name(name)));
+            }
+        }
+        out
+    }
+
+    fn bind(&self, slot: usize, locals: &Locals<'a>, value: ExprId) -> Stmt<'a> {
+        if self.shared.borrow().get(slot).copied().unwrap_or(false) {
+            return assign(self.e.b.name(locals.leaves[slot]), value);
+        }
+        number(locals.leaves[slot], value)
+    }
+
+    fn head(&self, node: NodeId, locals: &Locals<'a>, id: Option<u32>, before: Option<Stmt<'a>>) -> Block<'a> {
+        let bits = self.e.layout.node(node).bits;
+        let (chunks, owner, shared) = self.chunks(node);
+        if chunks.len() == 1 {
+            let mut out = self.stores(node, locals);
+            out.extend(before);
+            if bits > 0 {
+                out.extend(self.merge(node, locals, id));
+            }
+            return out;
+        }
+        let declared: Vec<(Name<'a>, std::borrow::Cow<'a, str>)> =
+            (0..shared.len()).filter(|slot| shared[*slot]).map(|slot| (locals.leaves[slot], "number".into())).collect();
+        let mut out: Block<'a> = before.into_iter().collect();
+        if !declared.is_empty() {
+            out.push(Stmt::Declare(declared));
+        }
+        *self.shared.borrow_mut() = shared;
+        for (index, range) in chunks.into_iter().enumerate() {
+            let mut body = self.stores_where(node, locals, &|slot| owner[slot] == index);
+            body.extend(self.merge_range(node, locals, id, range));
+            out.push(Stmt::Do(body));
+        }
+        self.shared.borrow_mut().clear();
+        out.push(increase(self.cursor(), self.e.b.number(bits)));
+        out
+    }
+
     fn merge(&self, node: NodeId, locals: &Locals<'a>, id: Option<u32>) -> Block<'a> {
+        let words = self.e.layout.node(node).words();
+        let body = self.merge_range(node, locals, id, 0..words);
+        vec![Stmt::Do(body), increase(self.cursor(), self.e.b.number(self.e.layout.node(node).bits))]
+    }
+
+    fn merge_range(&self, node: NodeId, locals: &Locals<'a>, id: Option<u32>, range: Range<u32>) -> Block<'a> {
         let b = self.e.b;
         let bits = self.e.layout.node(node).bits;
         let words = self.e.layout.node(node).words();
         let byte = || b.fixed("Byte");
         let at_byte = |offset: u32| if offset == 0 { byte() } else { b.add(byte(), b.number(offset)) };
-        let scaled = |at: u32| b.name(Name::Temp('M', at));
-        let carry = |at: u32| b.invoke(FLOOR, [b.mul(scaled(at), b.number(CARRY))]);
+        let scaled = |at: u32| Name::Temp('M', at % SCALED);
+        let carry = |at: u32| b.invoke(FLOOR, [b.mul(b.name(scaled(at)), b.number(CARRY))]);
+        let values = self.words(node, locals, id);
 
-        let mut body: Block<'a> = self
-            .words(node, locals, id)
-            .into_iter()
-            .enumerate()
-            .map(|(at, value)| local(Name::Temp('W', at as u32), value))
-            .collect();
-        body.push(local(Name::Fixed("Byte"), b.floor_div(self.cursor(), b.number(8))));
+        let mut body: Block<'a> = vec![local(Name::Fixed("Byte"), b.floor_div(self.cursor(), b.number(8)))];
         if self.aligned.get() {
-            for at in 0..words {
+            for (at, value) in (0..words).zip(values).filter(|(at, _)| range.contains(at)) {
                 let write = match bits - at * 32 {
                     8 => WRITEU8,
                     16 => WRITEU16,
                     _ => WRITEU32,
                 };
-                let value = b.name(Name::Temp('W', at));
                 body.push(Stmt::Call(b.invoke(write, [self.stream(), at_byte(at * 4), value])));
             }
-            return vec![Stmt::Do(body), increase(self.cursor(), b.number(bits))];
+            return body;
         }
         let shift = b.invoke(BAND, [self.cursor(), b.number(7)]);
-        body.push(local(Name::Fixed("P"), b.invoke(LSHIFT, [b.number(1), shift])));
-        for at in 0..words {
-            body.push(local(Name::Temp('M', at), b.mul(b.name(Name::Temp('W', at)), b.fixed("P"))));
+        body.insert(0, local(Name::Fixed("P"), b.invoke(LSHIFT, [b.number(1), shift])));
+        let declared = Cell::new([false; SCALED as usize]);
+        let hold = |at: u32| {
+            let mut seen = declared.get();
+            let first = !seen[(at % SCALED) as usize];
+            seen[(at % SCALED) as usize] = true;
+            declared.set(seen);
+            let value = b.mul(values[at as usize], b.fixed("P"));
+            if first { local(scaled(at), value) } else { assign(b.name(scaled(at)), value) }
+        };
+        let (start, end) = (range.start, range.end);
+        let top = end - 1;
+        body.push(hold(top));
+        if top > start {
+            body.push(hold(top - 1));
         }
-        if bits + 7 > words * 32 {
-            body.push(Stmt::Call(b.invoke(WRITEU8, [self.stream(), at_byte(words * 4), carry(words - 1)])));
+        if end < words || bits + 7 > words * 32 {
+            body.push(Stmt::Call(b.invoke(WRITEU8, [self.stream(), at_byte(end * 4), carry(top)])));
         }
-        for at in (1..words).rev() {
-            let value = b.add(scaled(at), carry(at - 1));
+        for at in (start + 1..end).rev() {
+            if at < top {
+                body.push(hold(at - 1));
+            }
+            let value = b.add(b.name(scaled(at)), carry(at - 1));
             body.push(Stmt::Call(b.invoke(WRITEU32, [self.stream(), at_byte(at * 4), value])));
         }
-        let kept = b.invoke(BAND, [b.invoke(READU8, [self.stream(), byte()]), b.sub(b.fixed("P"), b.number(1))]);
-        body.push(Stmt::Call(b.invoke(WRITEU32, [self.stream(), byte(), b.add(scaled(0), kept)])));
-        vec![Stmt::Do(body), increase(self.cursor(), b.number(bits))]
+        let bottom = at_byte(start * 4);
+        let kept = b.invoke(BAND, [b.invoke(READU8, [self.stream(), bottom]), b.sub(b.fixed("P"), b.number(1))]);
+        body.push(Stmt::Call(
+            b.invoke(WRITEU32, [self.stream(), at_byte(start * 4), b.add(b.name(scaled(start)), kept)]),
+        ));
+        body
     }
 
     fn id_merge(&self, code: u32) -> Stmt<'a> {
@@ -1041,10 +1224,7 @@ impl<'a> Writer<'_, '_, 'a> {
             if check && bits > 0 {
                 out.push(self.room(Some(self.e.b.number(bits))));
             }
-            out.extend(self.stores(node, &locals));
-            if self.e.layout.node(node).bits > 0 {
-                out.extend(self.merge(node, &locals, None));
-            }
+            out.extend(self.head(node, &locals, None, None));
             out.extend(self.tails(node, &locals));
             out
         })
@@ -1084,14 +1264,10 @@ impl<'a> Writer<'_, '_, 'a> {
                 body.push(local(Name::Fixed("InstanceCount"), self.header(12)));
             }
         }
-        body.extend(self.stores(node, &locals));
         if event.aligned {
-            body.push(self.id_merge(event.code));
-            if bits > 0 {
-                body.extend(self.merge(node, &locals, None));
-            }
+            body.extend(self.head(node, &locals, None, Some(self.id_merge(event.code))));
         } else {
-            body.extend(self.merge(node, &locals, Some(event.code)));
+            body.extend(self.head(node, &locals, Some(event.code), None));
         }
         body.extend(self.tails(node, &locals));
         body.push(self.write_header(0, self.cursor()));
@@ -1171,6 +1347,7 @@ pub fn writer<'a>(e: &Emitter<'_, 'a>, event: &EventLayout, spilled: bool) -> St
         trail: RefCell::new(Vec::new()),
         aligned: Cell::new(false),
         raw_floats: Cell::new(false),
+        shared: RefCell::new(Vec::new()),
     };
     let mut body = e.scope(base, || writer.message(event));
     e.hoist(&mut body);

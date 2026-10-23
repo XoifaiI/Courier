@@ -3,7 +3,7 @@
 //! A stream is one buffer: a 20 byte header, message bits from the front and string bytes from
 //! the back.
 
-use super::api::{api, bindings};
+use super::api::{api, bindings, middleware_types};
 use super::declarations::{alias, declarations, schema_types};
 use super::emitter::Emitter;
 use super::reader::{Reader, map_power};
@@ -28,6 +28,8 @@ const MAPS: &str = include_str!("templates/maps.luau");
 const MAX_LOCALS: usize = 200;
 
 const MAX_CHECKED_LINES: usize = 10_000;
+
+const MAX_CHECKED_FUNCTION: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -54,12 +56,12 @@ pub struct File {
 }
 
 pub fn generate(schema: &Schema, layout: &Layout, options: &Options) -> Result<Vec<File>, Error> {
-    let implementation = implementation(schema, layout, options)?;
-    if options.mode == Mode::Codec {
+    let (implementation, api_type) = implementation(schema, layout, options)?;
+    let Some(api_type) = api_type else {
         return Ok(vec![File { path: "", text: implementation }]);
-    }
+    };
     Ok(vec![
-        File { path: "init.luau", text: front(schema, layout, options) },
+        File { path: "init.luau", text: front(schema, layout, options, api_type) },
         File { path: "Implementation.luau", text: implementation },
     ])
 }
@@ -245,53 +247,57 @@ fn chunk_tables<'a>(e: &Emitter<'_, 'a>) -> Vec<Stmt<'a>> {
     out
 }
 
-fn runtime_types<'a>() -> [Stmt<'a>; 2] {
-    [
-        alias("Future", "<T...>", TypeBody::Inline("Courier.Future<T...>".into())),
-        alias("Middleware", "<T, A = { any }>", TypeBody::Inline("Courier.Middleware<T, A>".into())),
-    ]
+fn runtime_types<'a>(e: &Emitter<'_, 'a>, front: bool) -> Vec<Stmt<'a>> {
+    let mut out = vec![alias("Future", "<T...>", TypeBody::Inline("Courier.Future<T...>".into())), Stmt::Blank];
+    out.extend(middleware_types(e, front));
+    out
 }
 
-fn front(schema: &Schema, layout: &Layout, options: &Options) -> String {
+fn front<'a>(schema: &'a Schema<'a>, layout: &Layout<'a>, options: &'a Options, api_type: Stmt<'a>) -> String {
     let b = Ast::default();
     let e = Emitter::new(schema, layout, &b);
     let mut out = vec![Stmt::Verbatim("--!strict\n".into()), Stmt::Blank, require_runtime(&b, options, true)];
     let implementation = b.invoke(REQUIRE, [b.string("@self/Implementation")]);
     out.push(local(Name::Fixed("Implementation"), implementation));
     out.push(Stmt::Blank);
-    out.extend(runtime_types());
+    out.extend(runtime_types(&e, true));
     out.extend(schema_types(schema));
-    out.push(api(&e).0);
+    out.push(api_type);
     out.push(Stmt::Blank);
     out.push(Stmt::Return(vec![b.cast(b.cast(b.fixed("Implementation"), "any"), "Api")]));
     print(&b.finish(), &out)
 }
 
-fn implementation(schema: &Schema, layout: &Layout, options: &Options) -> Result<String, Error> {
+fn implementation<'a>(
+    schema: &'a Schema<'a>,
+    layout: &Layout<'a>,
+    options: &'a Options,
+) -> Result<(String, Option<Stmt<'a>>), Error> {
     let b = Ast::default();
     let e = Emitter::new(schema, layout, &b);
-    let mut out = assemble(&e, options, false);
+    let (mut out, mut api_type) = assemble(&e, options, false);
     if top_level_locals(&out) >= MAX_LOCALS {
-        out = assemble(&e, options, true);
+        (out, api_type) = assemble(&e, options, true);
     }
     let needed = top_level_locals(&out);
     if needed >= MAX_LOCALS {
         return Err(Error::TooManyLocals { needed });
     }
     let text = print(&b.finish(), &out);
-    if text.lines().count() > MAX_CHECKED_LINES {
-        return Ok(text.replacen("--!strict", "--!nocheck", 1));
+    let lines = text.bytes().filter(|&byte| byte == b'\n').count();
+    if lines > MAX_CHECKED_LINES || longest_function(&text) > MAX_CHECKED_FUNCTION {
+        return Ok((text.replacen("--!strict", "--!nocheck", 1), api_type));
     }
-    Ok(text)
+    Ok((text, api_type))
 }
 
-fn assemble<'a>(e: &Emitter<'_, 'a>, options: &'a Options, spill: bool) -> Vec<Stmt<'a>> {
+fn assemble<'a>(e: &Emitter<'_, 'a>, options: &'a Options, spill: bool) -> (Vec<Stmt<'a>>, Option<Stmt<'a>>) {
     let (mode, b) = (options.mode, e.b);
     let mut out = vec![Stmt::Verbatim("--!strict\n--!native\n--!optimize 2\n".into()), Stmt::Blank];
     if mode == Mode::Api {
         out.push(require_runtime(b, options, false));
         out.push(Stmt::Blank);
-        out.extend(runtime_types());
+        out.extend(runtime_types(e, false));
     }
     out.extend(declarations(e, mode));
     out.extend(runtime(e.layout, e.schema, mode));
@@ -318,14 +324,47 @@ fn assemble<'a>(e: &Emitter<'_, 'a>, options: &'a Options, spill: bool) -> Vec<S
         out.extend(Reader::new(e, direction.from, mode, spill).readers(direction, field));
     }
     match mode {
-        Mode::Codec => out.push(codec_exports(e, spill)),
+        Mode::Codec => {
+            out.push(codec_exports(e, spill));
+            (out, None)
+        }
         Mode::Api => {
             let (alias, table) = api(e);
-            out.extend([alias, Stmt::Blank]);
+            out.extend([alias.clone(), Stmt::Blank]);
             out.extend(table);
             out.extend([Stmt::Blank, bind(b), Stmt::Blank]);
             out.push(Stmt::Return(vec![b.fixed("API")]));
+            (out, Some(alias))
         }
     }
-    out
+}
+
+fn longest_function(text: &str) -> usize {
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut longest = 0;
+    for (number, line) in text.lines().enumerate() {
+        let indent = line.len() - line.trim_start_matches('\t').len();
+        let code = line.trim();
+        if code.starts_with("end") && open.last().is_some_and(|(at, _)| *at == indent) {
+            let (_, start) = open.pop().expect("an open function");
+            longest = longest.max(number - start);
+        }
+        let opens = code.starts_with("local function ") || code.contains("function(");
+        let closes = code.ends_with("end") || code.ends_with("end,") || code.ends_with("end)");
+        if opens && !closes {
+            open.push((indent, number));
+        }
+    }
+    longest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::longest_function;
+
+    #[test]
+    fn the_longest_function_counts_its_lines() {
+        let text = "local function A()\n\tif x then\n\t\ty()\n\tend\nend\n\nlocal B = (function()\n\treturn {\n\t\tC = function() end,\n\t}\nend)()\n";
+        assert_eq!(longest_function(text), 4);
+    }
 }

@@ -3,12 +3,27 @@
 use super::emitter::Emitter;
 use super::module::Mode;
 use super::reader::handlers_table;
-use super::types::{Typed, fields_typed, handler_type, parameters, payload_type, returns};
+use super::types::{Typed, arguments, call_type, fields_typed, handler_type, luau_type, parameters, returns};
 use super::writer::{writer, writer_name};
 use crate::layout::EventLayout;
 use crate::luau::builtins::{ERROR, LEN};
 use crate::luau::{Block, Entry, ExprId, Name, Parameter, Stmt, TypeBody, assign, local, when};
 use crate::schema::{CALL_ID, Field, FunctionId, Role, Side, UNION_TAG};
+
+const PICK_CALL: &str = concat!(
+    "type function PickCall(Union: type, Name: type)\n",
+    "\tlocal Variants = if Union:is(\"union\") then Union:components() else { Union }\n",
+    "\tfor _, Variant in Variants do\n",
+    "\t\tif Variant:readproperty(types.singleton(\"Name\")) == Name then\n",
+    "\t\t\treturn Variant\n",
+    "\t\tend\n",
+    "\tend\n",
+    "\tif Name:is(\"singleton\") then\n",
+    "\t\terror(`no event is named {Name:value()}`)\n",
+    "\tend\n",
+    "\terror(\"Call takes an event's name in quotes\")\n",
+    "end\n",
+);
 
 struct Method<'a> {
     key: &'static str,
@@ -115,10 +130,38 @@ impl<'a> Api<'_, '_, 'a> {
         let record = b.field(b.fixed("EVENTS"), self.event_name(event));
         let body = vec![
             self.expect_side(&format!("{label}.AddMiddleware"), receiver == Side::Server),
-            Stmt::Call(b.method(record, "AddMiddleware", [b.fixed("Middleware")])),
+            Stmt::Return(vec![b.method(record, "AddMiddleware", [b.fixed("Middleware")])]),
         ];
-        let payload = payload_type(self.e.schema, &self.e.schema.events[event.event]);
-        Method::new("AddMiddleware", vec![Typed::new("Middleware", format!("Middleware<any, {payload}>"))], "", body)
+        let call = call_type(self.e.schema, &self.e.schema.events[event.event]);
+        Method::new("AddMiddleware", vec![Typed::new("Middleware", format!("(Call: {call}) -> ()"))], "() -> ()", body)
+    }
+
+    fn add_everywhere(&self) -> ExprId {
+        let b = self.e.b;
+        let adds = |from: Side| {
+            let entries: Vec<Entry> = received(self.e)
+                .filter(|event| self.e.schema.events[event.event].from == from)
+                .map(|event| {
+                    let record = b.field(b.fixed("EVENTS"), self.event_name(event));
+                    Entry { key: None, value: b.method(record, "AddMiddleware", [b.fixed("Middleware")]) }
+                })
+                .collect();
+            b.table(entries, true)
+        };
+        let removers = b.if_else(b.fixed("IS_SERVER"), adds(Side::Client), adds(Side::Server));
+        let index = b.fixed("Index");
+        let remove = Stmt::For(
+            Name::Fixed("Index"),
+            b.number(1),
+            b.length(b.fixed("Removers")),
+            vec![Stmt::Call(b.call(b.index(b.fixed("Removers"), index), []))],
+        );
+        let body = vec![
+            Stmt::Local(Name::Fixed("Removers"), Some("{ () -> () }".into()), Some(removers)),
+            Stmt::Return(vec![self.closure(Vec::new(), "", vec![remove])]),
+        ];
+        let parameters = vec![Parameter::new(Name::Fixed("Middleware"), "(Call: Calls) -> ()")];
+        self.closure(parameters, "() -> ()", body)
     }
 
     fn fires(&self, event: &EventLayout) -> Vec<Method<'a>> {
@@ -306,6 +349,47 @@ impl<'a> Api<'_, '_, 'a> {
     }
 }
 
+fn received<'e, 'a>(e: &'e Emitter<'_, 'a>) -> impl Iterator<Item = &'e EventLayout> {
+    e.layout.events().map(|(_, event)| event).filter(|event| !matches!(event.role, Role::Reply(_)))
+}
+
+pub fn middleware_types<'a>(e: &Emitter<'_, 'a>, front: bool) -> Vec<Stmt<'a>> {
+    let calls: Vec<String> = received(e).map(|event| call_type(e.schema, &e.schema.events[event.event])).collect();
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if front {
+        out.extend([Stmt::Verbatim(PICK_CALL.into()), Stmt::Blank]);
+    }
+    let union = TypeBody::Inline(calls.join("\n\t| ").into());
+    out.push(Stmt::TypeAlias { name: "Calls".into(), generics: "", body: union });
+    if front {
+        let pick = TypeBody::Inline("PickCall<Calls, N>".into());
+        out.push(Stmt::TypeAlias { name: "Call".into(), generics: "<N>", body: pick });
+    }
+    out.push(Stmt::Blank);
+    out
+}
+
+fn pack_and_unpack<'a>(e: &Emitter<'_, 'a>, event: &EventLayout) -> [ExprId; 2] {
+    let b = e.b;
+    let fields = arguments(&e.schema.events[event.event]);
+    let pack_parameters =
+        fields.iter().map(|field| Parameter::new(Name::Fixed(&field.name), luau_type(e.schema, field.ty, false)));
+    let packed =
+        fields.iter().map(|field| Entry { key: Some(field.name.as_ref().into()), value: b.fixed(&field.name) });
+    let pack = b.function(
+        pack_parameters.collect(),
+        String::new(),
+        vec![Stmt::Return(vec![b.table(packed.collect::<Vec<_>>(), false)])],
+    );
+    let unpacked = fields.iter().map(|field| b.field(b.fixed("Args"), &field.name)).collect();
+    let unpack_parameters = vec![Parameter::new(Name::Fixed("Args"), "{ [string]: unknown }")];
+    let unpack = b.function(unpack_parameters, String::new(), vec![Stmt::Return(unpacked)]);
+    [pack, unpack]
+}
+
 pub fn bindings<'a>(e: &Emitter<'_, 'a>) -> Block<'a> {
     let b = e.b;
     let from_runtime =
@@ -328,14 +412,10 @@ pub fn bindings<'a>(e: &Emitter<'_, 'a>) -> Block<'a> {
         out.push(from_runtime("INVOKE", "Invoke"));
         out.push(from_runtime("COMPLETE", "Complete"));
     }
-    let events = e.layout.events().filter(|(_, event)| !matches!(event.role, Role::Reply(_))).map(|(_, event)| {
-        let declared = &e.schema.events[event.event];
-        let count = match event.role {
-            Role::Request(_) => declared.fields.len() - 1,
-            _ => declared.fields.len(),
-        };
-        let name: &'a str = &declared.name;
-        let record = b.invoke("Courier.Event", [b.string(name), b.number(count as f64)]);
+    let events = received(e).map(|event| {
+        let name: &'a str = &e.schema.events[event.event].name;
+        let [pack, unpack] = pack_and_unpack(e, event);
+        let record = b.invoke("Courier.Event", [b.string(name), pack, unpack]);
         Entry { key: Some(name.into()), value: record }
     });
     out.push(local(Name::Fixed("EVENTS"), b.table(events.collect::<Vec<_>>(), true)));
@@ -362,6 +442,10 @@ pub fn api<'a>(e: &Emitter<'_, 'a>) -> (Stmt<'a>, Vec<Stmt<'a>>) {
         };
         entries.push(assign(e.b.field(e.b.fixed("API"), key), value));
         types.push((key.into(), ty.into()));
+    }
+    if received(e).next().is_some() {
+        entries.push(assign(e.b.field(e.b.fixed("API"), "AddMiddleware"), api.add_everywhere()));
+        types.push(("AddMiddleware".into(), "(Middleware: (Call: Calls) -> ()) -> () -> ()".into()));
     }
     let alias = Stmt::TypeAlias { name: "Api".into(), generics: "", body: TypeBody::Fields(types) };
     let mut table =

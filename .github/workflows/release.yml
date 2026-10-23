@@ -1,7 +1,3 @@
-# Builds the courier compiler for each platform, the VS Code extension and Courier.rbxm when a v* tag
-# is pushed, and attaches them to a draft GitHub release. Nothing goes public until the draft is
-# published by hand. Asset names carry the platform as Rokit reads it, so `rokit add XoifaiI/Courier`
-# installs the right one once the release is public.
 name: Release
 
 on:
@@ -58,24 +54,22 @@ jobs:
           name: courier-vscode
           path: editors/vscode/*.vsix
 
-  runtime:
+  wally:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Build Courier.rbxm
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Assemble the Wally package
         run: |
-          gh release download v7.7.0 --repo rojo-rbx/rojo --pattern "rojo-7.7.0-linux-x86_64.zip"
-          unzip -q rojo-7.7.0-linux-x86_64.zip
-          ./rojo build default.project.json -o Courier.rbxm
+          mkdir -p dist/courier
+          cp -r src LICENSE packaging/wally.toml packaging/default.project.json dist/courier/
+          cd dist && zip -qr "../courier-wally-${GITHUB_REF_NAME}.zip" courier
       - uses: actions/upload-artifact@v7
         with:
-          name: courier-runtime
-          path: Courier.rbxm
+          name: courier-wally
+          path: courier-wally-*.zip
 
   draft:
-    needs: [compiler, extension, runtime]
+    needs: [compiler, extension, wally]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

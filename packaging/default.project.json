@@ -1,0 +1,6 @@
+{
+	"name": "Courier",
+	"tree": {
+		"$path": "src"
+	}
+}

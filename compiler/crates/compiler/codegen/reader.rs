@@ -3,11 +3,12 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::ops::Range;
 
 use super::emitter::Emitter;
 use super::module::Mode;
 use super::types::enum_table;
-use super::writer::{F32_LIMIT, chunk_bits, chunk_table, count_max};
+use super::writer::{CHUNK_WORDS, F32_LIMIT, WIDE_LOCALS, chunk_bits, chunk_table, count_max};
 
 const MAP_POWER: u32 = 10;
 use crate::layout::{
@@ -164,11 +165,54 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         high
     }
 
+    fn wide(&self, node: NodeId) -> bool {
+        let layout = &self.e.layout;
+        let groups: usize = layout.groups(node).iter().map(|group| group.members.len() + 1).sum();
+        2 * layout.node(node).words() as usize + layout.leaves(node).len() + groups > WIDE_LOCALS
+    }
+
+    fn inline(&self, event: &EventLayout) -> bool {
+        self.e.layout.tails(event.node).is_empty() && !self.wide(event.node)
+    }
+
+    fn chunks(&self, node: NodeId) -> Vec<Range<u32>> {
+        let words = self.e.layout.node(node).words();
+        if !self.wide(node) {
+            return std::iter::once(0..words).collect();
+        }
+        (0..words).step_by(CHUNK_WORDS as usize).map(|start| start..(start + CHUNK_WORDS).min(words)).collect()
+    }
+
+    fn reach(&self, node: NodeId, range: &Range<u32>) -> Range<u32> {
+        let words = self.e.layout.node(node).words();
+        let crosses = self.e.layout.leaves(node).iter().any(|leaf| {
+            leaf.is_placed()
+                && range.contains(&(leaf.position / 32))
+                && (leaf.position + leaf.bits.max(1) - 1) / 32 >= range.end
+        });
+        if crosses && range.end < words { range.start..range.end + 1 } else { range.clone() }
+    }
+
     fn rebuild(&self, node: NodeId, first_word_read: bool) -> Block<'a> {
+        self.rebuild_range(node, first_word_read, 0..self.e.layout.node(node).words())
+    }
+
+    fn rebuild_range(&self, node: NodeId, first_word_read: bool, range: Range<u32>) -> Block<'a> {
         let b = self.e.b;
-        let used = self.used_words(node);
+        let start = range.start;
+        let used: Vec<bool> = self
+            .used_words(node)
+            .into_iter()
+            .enumerate()
+            .map(|(at, is_used)| is_used && range.contains(&(at as u32)))
+            .collect();
         if self.aligned.get() {
-            let direct = self.e.layout.leaves(node).iter().any(|leaf| self.direct(leaf).is_some());
+            let direct = self
+                .e
+                .layout
+                .leaves(node)
+                .iter()
+                .any(|leaf| self.direct(leaf).is_some() && range.contains(&(leaf.position / 32)));
             if !direct && !used.iter().any(|&is_used| is_used) {
                 return Vec::new();
             }
@@ -186,19 +230,25 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         if !used.iter().any(|&is_used| is_used) {
             return Vec::new();
         }
-        let high = self.high_parts(node);
+        let high: Vec<bool> = self
+            .high_parts(node)
+            .into_iter()
+            .enumerate()
+            .map(|(at, needed)| needed && range.contains(&(at as u32)))
+            .collect();
         let words = self.e.layout.node(node).words();
         let raw = |at: u32| b.name(Name::Temp('A', at));
         let mut out = Vec::new();
         if !first_word_read {
             out.push(local(Name::Fixed("Byte"), b.floor_div(self.cursor(), b.number(8))));
             out.push(local(Name::Fixed("Shift"), b.invoke(BAND, [self.cursor(), b.number(7)])));
-            out.push(local(Name::Temp('A', 0), b.invoke(READU32, [self.source(), b.fixed("Byte")])));
+            let first = if start == 0 { b.fixed("Byte") } else { b.add(b.fixed("Byte"), b.number(start * 4)) };
+            out.push(local(Name::Temp('A', start), b.invoke(READU32, [self.source(), first])));
         }
         if high.iter().any(|&needed| needed) {
             out.push(local(Name::Fixed("Back"), b.sub(b.number(31), b.fixed("Shift"))));
         }
-        for at in 1..=words {
+        for at in start + 1..=range.end.min(words) {
             if high[at as usize - 1] || (at < words && used[at as usize]) {
                 let read = if at == words { READU8 } else { READU32 };
                 let offset = b.add(b.fixed("Byte"), b.number(at * 4));
@@ -293,11 +343,15 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         node: NodeId,
         part: impl Fn(LeafSlot) -> ExprId,
         refuse: impl Fn() -> Block<'a>,
+        only: Option<usize>,
     ) -> (Block<'a>, Vec<Option<ExprId>>) {
         let (e, b) = (self.e, self.e.b);
         let mut out = Vec::new();
         let mut digits = vec![None; e.layout.leaves(node).len()];
-        for group in e.layout.groups(node) {
+        for (index, group) in e.layout.groups(node).iter().enumerate() {
+            if only.is_some_and(|only| only != index) {
+                continue;
+            }
             let packed = match group.high {
                 None => part(group.low),
                 Some(high) => b.add(part(group.low), b.mul(part(high), b.number(4_294_967_296.0))),
@@ -390,27 +444,55 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         if !leaves.is_empty() {
             let declared = leaves.iter().zip(&locals.leaves).map(|(leaf, name)| (*name, self.leaf_type(leaf)));
             out.push(Stmt::Declare(declared.collect()));
-            let mut body = self.rebuild(node, false);
-            for (slot, (leaf, name)) in leaves.iter().zip(&locals.leaves).enumerate() {
-                if matches!(leaf.kind, LeafKind::Value(Codec::F64 { high: true })) {
-                    let low = b.name(locals.leaves[slot - 1]);
-                    let high = e.temp('S');
-                    body.push(local(high, self.extract(leaf)));
-                    body.push(when(self.non_finite(leaf, b.name(high)).expect("a high word"), vec![self.refuse()]));
-                    body.push(assign(b.name(*name), b.invoke("BitsF64", [low, b.name(high)])));
-                } else if leaf.is_placed() {
-                    body.extend(self.leaf_assign(leaf, *name));
+            let chunks = self.chunks(node);
+            let wide = chunks.len() > 1;
+            let last = chunks.len() - 1;
+            let mut body = Vec::new();
+            for (index, range) in chunks.into_iter().enumerate() {
+                body.extend(self.rebuild_range(node, false, self.reach(node, &range)));
+                for (slot, (leaf, name)) in leaves.iter().zip(&locals.leaves).enumerate() {
+                    if !range.contains(&(leaf.position / 32)) {
+                        continue;
+                    }
+                    if matches!(leaf.kind, LeafKind::Value(Codec::F64 { high: true })) {
+                        let low = b.name(locals.leaves[slot - 1]);
+                        let high = e.temp('S');
+                        body.push(local(high, self.extract(leaf)));
+                        body.push(when(self.non_finite(leaf, b.name(high)).expect("a high word"), vec![self.refuse()]));
+                        body.push(assign(b.name(*name), b.invoke("BitsF64", [low, b.name(high)])));
+                    } else if leaf.is_placed() {
+                        let assigned = self.leaf_assign(leaf, *name);
+                        if wide && assigned.len() > 1 {
+                            body.push(Stmt::Do(assigned));
+                        } else {
+                            body.extend(assigned);
+                        }
+                    }
+                }
+                if index < last || wide {
+                    out.push(Stmt::Do(std::mem::take(&mut body)));
                 }
             }
-            let (reads, digits) =
-                self.group_reads(node, |slot| b.name(locals.leaves[slot.0 as usize]), || vec![self.refuse()]);
-            body.extend(reads);
-            for ((leaf, name), digit) in leaves.iter().zip(&locals.leaves).zip(digits) {
-                if let Some(digit) = digit {
-                    body.push(assign(b.name(*name), self.leaf_value(leaf, digit)));
+            let groups = e.layout.groups(node).len();
+            let passes: Vec<Option<usize>> = if wide { (0..groups).map(Some).collect() } else { vec![None] };
+            for pass in passes {
+                let part = |slot: LeafSlot| b.name(locals.leaves[slot.0 as usize]);
+                let (reads, digits) = self.group_reads(node, part, || vec![self.refuse()], pass);
+                let mut split = reads;
+                for ((leaf, name), digit) in leaves.iter().zip(&locals.leaves).zip(digits) {
+                    if let Some(digit) = digit {
+                        split.push(assign(b.name(*name), self.leaf_value(leaf, digit)));
+                    }
+                }
+                if wide {
+                    out.push(Stmt::Do(split));
+                } else {
+                    body.extend(split);
                 }
             }
-            out.push(Stmt::Do(body));
+            if !wide {
+                out.push(Stmt::Do(body));
+            }
         }
         if bits > 0 && self.item_byte.get().is_none() {
             out.push(increase(self.cursor(), b.number(bits)));
@@ -930,7 +1012,7 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         out.extend(self.rebuild(node, true));
         let leaves = e.layout.leaves(node);
         let (reads, digits) =
-            self.group_reads(node, |slot| self.extract(&leaves[slot.0 as usize]), || self.refuse_in_loop());
+            self.group_reads(node, |slot| self.extract(&leaves[slot.0 as usize]), || self.refuse_in_loop(), None);
         let mut values = Vec::new();
         let mut checks = Vec::new();
         for (leaf, digit) in leaves.iter().zip(digits) {
@@ -979,8 +1061,8 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
     }
 
     fn leaf(&self, event: &EventLayout) -> Block<'a> {
-        let (e, b) = (self.e, self.e.b);
-        if e.layout.tails(event.node).is_empty() {
+        let b = self.e.b;
+        if self.inline(event) {
             assert!(!event.aligned, "an aligned event holds a list or map, so it has tails");
             return self.fixed_leaf(event);
         }
@@ -1078,7 +1160,7 @@ impl<'f, 'e, 'a> Reader<'f, 'e, 'a> {
         let (e, b) = (self.e, self.e.b);
         let mut out = Vec::new();
         for event in &direction.events {
-            if !e.layout.tails(event.node).is_empty() {
+            if !self.inline(event) {
                 let reader = self.event_reader(event);
                 out.push(if self.spill { into_field(reader, self.reader_callee(event)) } else { reader });
                 out.push(Stmt::Blank);

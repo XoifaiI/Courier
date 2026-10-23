@@ -1,30 +1,13 @@
 --!strict
 
 --[=[
-	Types: the shapes the runtime, middleware and generated schema modules share
+	Types: the shapes the runtime and generated schema modules share
+
+	A schema module types each event's Call exactly; Middleware takes (Call: never) so the runtime
+	accepts any of them
 
 	Return type: nothing; require it for its exported types
 --]=]
-
-export type function Decompose(generic: type)
-	if generic:is("nil") then
-		return types.any
-	end
-
-	local invalid: { typeof(generic.tag) } = { "nil", "unknown" }
-	if table.find(invalid, generic.tag) then
-		return types.never
-	end
-
-	if generic:is("function") then
-		local head = generic:returns().head
-		assert(head and head[1] ~= nil, `expected function to return one argument`)
-
-		return head[1]
-	end
-
-	return generic
-end
 
 export type Packed = { n: number, [number]: any }
 
@@ -51,58 +34,25 @@ export type Result<T, E> =
 		read Reason: E,
 	}
 
-export type Origin = "Server" | "Client"
-export type Direction = "Inbound" | "Outbound"
-export type Metadata = {
-	read Origin: Origin,
+export type Args = { [string]: unknown }
+
+export type Call = {
+	read Name: string,
 	read Player: Player?,
-	read Direction: Direction,
+	Args: Args,
+	read Shared: { [unknown]: unknown },
+	State: Result<nil, string>,
+	read Reject: (self: Call, Reason: string) -> (),
 }
 
-export type Call<A = { any }> = {
-	read Shared: { [any]: any },
-	read Metadata: Metadata,
-	read Args: A,
-	read Count: number,
-	State: Result<any, any>,
-
-	read Reject: (self: any, Reason: any) -> (),
-}
-
-export type MiddlewareCallback<T, A = { any }> = (Call<A>, Decompose<T>) -> ()
-
-type MiddlewareImpl<T, A> = {
-	__index: MiddlewareImpl<T, A>,
-	GetDataFor: (self: Middleware<T, A>, EventName: string) -> T,
-}
-
-export type Middleware<T, A = { any }> = setmetatable<{
-	Template: T,
-	EventData: { [string]: T },
-	read Callback: MiddlewareCallback<T, A>,
-}, MiddlewareImpl<T, A>>
-
-export type Middlewares = {
-	read Ratelimiter: Middleware<RateLimiter>,
-}
-
-export type Bucket = {
-	Tokens: number,
-	Last: number,
-}
-
-export type RateLimiter = {
-	Capacity: number,
-	RefillPerSecond: number,
-	Buckets: { [Player]: Bucket },
-}
+export type Middleware = (Call: never) -> ()
 
 export type Reply = (Peer: Player?, CallId: number, Success: boolean, ...any) -> ()
 
 type EventImpl = {
 	__index: EventImpl,
-	AddMiddleware: (self: Event, Middleware: Middleware<any>) -> (),
-	RunMiddlewares: (self: Event, Sender: Player?, Args: { any }) -> (Call?, any),
+	AddMiddleware: (self: Event, Middleware: Middleware) -> () -> (),
+	RunMiddlewares: (self: Event, Sender: Player?, Args: Args) -> (Call?, string?),
 	Handle: (self: Event, Handler: (...any) -> (), Sender: Player?, ...any) -> (),
 	Respond: (self: Event, Handler: (...any) -> ...any, Sender: Player?, CallId: number, ...any) -> (),
 	HandleInvoke: (self: Event, Handler: any, Sender: Player?, CallId: number, ...any) -> (),
@@ -110,10 +60,10 @@ type EventImpl = {
 
 export type Event = setmetatable<{
 	read Name: string,
-	read Count: number,
-	read Middlewares: { Middleware<any> },
-	read Data: { any },
-	read Call: { __index: any },
+	read Pack: (...any) -> Args,
+	read Unpack: (Args: Args) -> ...any,
+	Middlewares: { (Call: Call) -> () },
+	read Call: { __index: unknown },
 	Reply: Reply?,
 }, EventImpl>
 

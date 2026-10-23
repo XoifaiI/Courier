@@ -1,6 +1,29 @@
 {
 	"name": "Courier",
 	"tree": {
-		"$path": "src"
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"Courier": {
+				"$path": "src"
+			},
+			"CourierTest": {
+				"$path": { "optional": "Internal/studio/CourierTest" }
+			}
+		},
+		"ServerScriptService": {
+			"CourierTest": {
+				"$path": { "optional": "Internal/studio/Server.server.luau" }
+			},
+			"CourierBench": {
+				"$path": { "optional": "Internal/studio/Bench.server.luau" }
+			}
+		},
+		"StarterPlayer": {
+			"StarterPlayerScripts": {
+				"CourierTest": {
+					"$path": { "optional": "Internal/studio/Client.client.luau" }
+				}
+			}
+		}
 	}
 }

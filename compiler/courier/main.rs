@@ -18,13 +18,11 @@ use courier_compiler::codegen::{File, Mode, Options, Runtime};
 
 const SKIPPED: [&str; 3] = ["node_modules", "Packages", "target"];
 
-const RUNTIME: [(&str, &str); 6] = [
+const RUNTIME: [(&str, &str); 4] = [
     ("Courier/init.luau", include_str!("../../src/init.luau")),
     ("Courier/Future.luau", include_str!("../../src/Future.luau")),
     ("Courier/Result.luau", include_str!("../../src/Result.luau")),
     ("Courier/Types.luau", include_str!("../../src/Types.luau")),
-    ("Courier/Middlewares/init.luau", include_str!("../../src/Middlewares/init.luau")),
-    ("Courier/Middlewares/Ratelimiter.luau", include_str!("../../src/Middlewares/Ratelimiter.luau")),
 ];
 
 const FRONT: &str = "require(\"@self/Implementation\")";

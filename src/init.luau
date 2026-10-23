@@ -5,6 +5,9 @@
 	Courier: the runtime behind a compiled schema. It owns the remotes, sends each player's
 	messages once per Heartbeat, and runs handlers, middleware and calls
 
+	A middleware is a function of the event's Call; it can change Call.Args, which the handler then
+	receives, or Reject the call
+
 	Set Config before requiring the schema. ReliableCapacity is how much a stream holds before it
 	sends early, and MaxFrameBytes is the biggest frame the server will read from a client
 
@@ -28,18 +31,17 @@ local Result = require("@self/Result")
 
 local Spawn = Future.Spawn
 
+type Args = Types.Args
 type Config = Types.Config
 type Event = Types.Event
-type Metadata = Types.Metadata
-type MiddlewareCallback<T, A = { any }> = Types.MiddlewareCallback<T, A>
 type Reply = Types.Reply
 type Schema = Types.Schema
 type Stream = Types.Stream
 type Done = (Success: boolean, ...any) -> ()
 
-export type Call<A = { any }> = Types.Call<A>
+export type Call = Types.Call
 export type Future<T...> = Types.Future<T...>
-export type Middleware<T, A = { any }> = Types.Middleware<T, A>
+export type Middleware = Types.Middleware
 
 local IS_SERVER = RunService:IsServer()
 
@@ -66,27 +68,12 @@ local StreamOwner: { [Stream]: Player } = {}
 local StreamReliable: { [Stream]: boolean } = {}
 
 local PendingByPlayer: { [Player]: { [number]: Done } } = {}
-local PlayerMetadata: { [Player]: Metadata } = {}
 local ClientPending: { [number]: Done } = {}
 local NextCallId = 0
 
 local SUCCESS = Result.SUCCESS
-local CLIENT_METADATA: Metadata = table.freeze({ Origin = "Server", Direction = "Inbound" } :: Metadata)
-local Rejections: { [any]: Types.Result<any, any> } = setmetatable({}, { __mode = "v" }) :: any
+local Rejections: { [string]: Types.Result<nil, string> } = setmetatable({}, { __mode = "v" }) :: any
 local WarnedFrameSize = false
-
-local function DeepCopy<T>(Target: T): T
-	local Source: any = Target
-	if type(Source) ~= "table" then
-		return Target
-	end
-
-	local Copy = {}
-	for Key, Value in Source do
-		Copy[Key] = if type(Value) == "table" then DeepCopy(Value) else Value
-	end
-	return Copy :: any
-end
 
 local function SendResults(Reply: Reply, Name: string, Sender: Player?, CallId: number, Success: boolean, ...: any)
 	if Success then
@@ -102,14 +89,6 @@ local function PendingFor(Peer: Player?): { [number]: Done }?
 		return PendingByPlayer[Peer]
 	end
 	return ClientPending
-end
-
-local function MetadataFor(Sender: Player?): Metadata
-	if Sender == nil then
-		return CLIENT_METADATA
-	end
-	return PlayerMetadata[Sender]
-		or table.freeze({ Origin = "Client", Player = Sender, Direction = "Inbound" } :: Metadata)
 end
 
 local function Send(Stream: Stream)
@@ -195,7 +174,6 @@ local function AddPlayer(Player: Player)
 	table.insert(PlayerList, Player)
 	table.insert(StreamList, Streams)
 	PendingByPlayer[Player] = {}
-	PlayerMetadata[Player] = table.freeze({ Origin = "Client", Player = Player, Direction = "Inbound" } :: Metadata)
 end
 
 local function RemovePlayer(Player: Player)
@@ -218,7 +196,6 @@ local function RemovePlayer(Player: Player)
 
 	local Pending = PendingByPlayer[Player]
 	PendingByPlayer[Player] = nil
-	PlayerMetadata[Player] = nil
 	if Pending then
 		for _, Settled in Pending do
 			Settled(false, "the player left")
@@ -229,11 +206,7 @@ end
 local CallProto = {}
 CallProto.__index = CallProto
 
-function CallProto.Reject(self: Call, Reason: any)
-	if Reason == nil or Reason ~= Reason then
-		self.State = Result.Error(Reason)
-		return
-	end
+function CallProto.Reject(self: Call, Reason: string)
 	local Rejection = Rejections[Reason]
 	if Rejection == nil then
 		Rejection = Result.Error(Reason)
@@ -242,44 +215,41 @@ function CallProto.Reject(self: Call, Reason: any)
 	self.State = Rejection
 end
 
-local MiddlewareProto = {}
-MiddlewareProto.__index = MiddlewareProto
-
-function MiddlewareProto.GetDataFor<T>(self: Middleware<T>, EventName: string): T
-	if not self.EventData[EventName] then
-		local Template = if type(self.Template) == "function" then (self.Template :: any)() else DeepCopy(self.Template)
-		self.EventData[EventName] = Template
-	end
-
-	return self.EventData[EventName]
-end
-
 local EventProto = {}
 EventProto.__index = EventProto
 
-function EventProto.AddMiddleware(self: Event, Middleware: Middleware<any>)
-	if not table.find(self.Middlewares, Middleware) then
-		table.insert(self.Middlewares, Middleware)
-		table.insert(self.Data, Middleware:GetDataFor(self.Name))
+function EventProto.AddMiddleware(self: Event, Middleware: Middleware): () -> ()
+	local Added = Middleware :: (Call: Call) -> ()
+	if not table.find(self.Middlewares, Added) then
+		local Middlewares = table.clone(self.Middlewares)
+		table.insert(Middlewares, Added)
+		self.Middlewares = Middlewares
+	end
+	return function()
+		local Index = table.find(self.Middlewares, Added)
+		if Index then
+			local Middlewares = table.clone(self.Middlewares)
+			table.remove(Middlewares, Index)
+			self.Middlewares = Middlewares
+		end
 	end
 end
 
-function EventProto.RunMiddlewares(self: Event, Sender: Player?, Args: { any }): (Call?, any)
+function EventProto.RunMiddlewares(self: Event, Sender: Player?, Args: Args): (Call?, string?)
 	local Context: Call = setmetatable({
-		Metadata = MetadataFor(Sender),
+		Player = Sender,
 		Args = Args,
 		Shared = {},
 		State = SUCCESS,
 	}, self.Call) :: any
-	local Data = self.Data
-	for Index, Middleware in self.Middlewares do
-		Middleware.Callback(Context, Data[Index])
+	for _, Middleware in self.Middlewares do
+		Middleware(Context)
 		local State = Context.State
 		if State ~= SUCCESS and State.Result == "Error" then
 			return nil, State.Reason
 		end
 	end
-	return Context
+	return Context, nil
 end
 
 function EventProto.Handle(self: Event, Handler: (...any) -> (), Sender: Player?, ...: any)
@@ -291,15 +261,14 @@ function EventProto.Handle(self: Event, Handler: (...any) -> (), Sender: Player?
 		end
 		return
 	end
-	local Context = self:RunMiddlewares(Sender, { ... })
+	local Context = self:RunMiddlewares(Sender, self.Pack(...))
 	if Context == nil then
 		return
 	end
-	local Args, Count = Context.Args, self.Count
 	if Sender then
-		Spawn(Handler, Sender, table.unpack(Args, 1, Count))
+		Spawn(Handler, Sender, self.Unpack(Context.Args))
 	else
-		Spawn(Handler, table.unpack(Args, 1, Count))
+		Spawn(Handler, self.Unpack(Context.Args))
 	end
 end
 
@@ -314,16 +283,15 @@ function EventProto.Respond(self: Event, Handler: (...any) -> ...any, Sender: Pl
 		return
 	end
 
-	local Context, Reason = self:RunMiddlewares(Sender, { ... })
+	local Context, Reason = self:RunMiddlewares(Sender, self.Pack(...))
 	if Context == nil then
-		Reply(Sender, CallId, false, if Reason ~= nil then tostring(Reason) else "the call was rejected")
+		Reply(Sender, CallId, false, Reason or "the call was rejected")
 		return
 	end
-	local Args, Count = Context.Args, self.Count
 	if Sender then
-		SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, Sender, table.unpack(Args, 1, Count)))
+		SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, Sender, self.Unpack(Context.Args)))
 	else
-		SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, table.unpack(Args, 1, Count)))
+		SendResults(Reply, self.Name, Sender, CallId, pcall(Handler, self.Unpack(Context.Args)))
 	end
 end
 
@@ -335,24 +303,13 @@ function EventProto.HandleInvoke(self: Event, Handler: any, Sender: Player?, Cal
 	Spawn(self.Respond, self, Handler, Sender, CallId, ...)
 end
 
-function Courier.Middleware<T, A>(Callback: MiddlewareCallback<T, A>, Template: T?): Middleware<T, A>
-	return setmetatable(
-		{
-			Template = Template,
-			EventData = {},
-			Callback = Callback,
-		} :: any,
-		MiddlewareProto
-	) :: any
-end
-
-function Courier.Event(Name: string, Count: number): Event
+function Courier.Event(Name: string, Pack: (...any) -> Args, Unpack: (Args: Args) -> ...any): Event
 	return setmetatable({
 		Name = Name,
-		Count = Count,
+		Pack = Pack,
+		Unpack = Unpack,
 		Middlewares = {},
-		Data = {},
-		Call = { __index = setmetatable({ Count = Count }, CallProto) },
+		Call = { __index = setmetatable({ Name = Name }, CallProto) },
 	}, EventProto) :: any
 end
 
@@ -441,6 +398,5 @@ Courier.PlayerStreams = PlayerStreams
 Courier.PlayerList = PlayerList
 Courier.StreamList = StreamList
 Courier.ClientStreams = ClientStreams
-Courier.Middlewares = require("@self/Middlewares")(Courier)
 
 return Courier
